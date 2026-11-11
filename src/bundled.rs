@@ -30,8 +30,12 @@ const FFMPEG: &[u8] = include_bytes!("../vendor/ffmpeg.exe");
 const FFPROBE: &[u8] = include_bytes!("../vendor/ffprobe.exe");
 /// The GPL text, unpacked beside the two programs: FFmpeg is not Apache-licensed
 /// and the licence has to travel with the binary.
+///
+/// It is read from `third-party/`, which is in the repository, and not from
+/// `vendor/`, which is a download folder the build fills and git ignores.  A
+/// clone has to be able to compile this line without fetching anything first.
 #[cfg(not(debug_assertions))]
-const FFMPEG_LICENSE: &[u8] = include_bytes!("../vendor/FFmpeg-LICENSE.txt");
+const FFMPEG_LICENSE: &[u8] = include_bytes!("../third-party/GPL-3.0.txt");
 
 /// The two programs this executable carries.
 pub fn bins() -> Res<Bins> {

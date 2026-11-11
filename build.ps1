@@ -21,7 +21,13 @@
 #
 #  FFmpeg: ffmpeg.exe and ffprobe.exe from vendor\ are packed into the
 #  executable. If they are not there yet they are downloaded once (about 110 MB)
-#  from gyan.dev's "essentials" build.
+#  from the one pinned gyan.dev package named below, and the download is checked
+#  against that package's published SHA256 before anything uses it.
+#
+#  The pin matters twice over. GPL v3 asks for the source that corresponds to
+#  the binary actually shipped, so the version cannot drift silently under a
+#  document that names one version; and a fixed checksum is what makes "the
+#  same build" mean something.
 # =============================================================================
 
 #  The -Debug switch is deliberately not [CmdletBinding()]: with that attribute
@@ -41,7 +47,15 @@ $cargoToml = Join-Path $root 'Cargo.toml'
 $vendorDir = Join-Path $root 'vendor'
 $distDir = Join-Path $root 'dist'
 
-$ffmpegUrl = 'https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip'
+# The FFmpeg build that is packed into every release, named exactly rather than
+# left as "whatever is latest": the release notes and THIRD-PARTY.md point at the
+# source for this version, and they would stop being true if this URL floated.
+#
+# The hash is the one gyan.dev publishes at
+# https://www.gyan.dev/ffmpeg/builds/packages/ffmpeg-9.0.2-essentials_build.zip.sha256
+$ffmpegVersion = '9.0.2'
+$ffmpegUrl     = 'https://www.gyan.dev/ffmpeg/builds/packages/ffmpeg-9.0.2-essentials_build.zip'
+$ffmpegSha256  = '60f467265b1e312373dbcd92200c2618a74850f98d3d078e94296bb3fa2047ba'
 
 # --- the version, from the one place that holds it ---------------------------
 
@@ -119,10 +133,20 @@ function Get-VendorBinaries {
     if (-not $missing) { return }
 
     Write-Host ''
-    Write-Host ("Downloading FFmpeg once ({0})..." -f $ffmpegUrl)
+    Write-Host ("Downloading FFmpeg {0} once ({1})..." -f $ffmpegVersion, $ffmpegUrl)
     New-Item -ItemType Directory -Force -Path $vendorDir | Out-Null
     $zip = Join-Path $env:TEMP 'finnCrop-ffmpeg-essentials.zip'
     Invoke-WebRequest -Uri $ffmpegUrl -OutFile $zip -UseBasicParsing
+
+    # The download is checked before it is unpacked: a substituted or truncated
+    # archive must not end up inside a release.
+    $actual = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+    if ($actual -ne $ffmpegSha256) {
+        Add-Type -AssemblyName Microsoft.VisualBasic
+        [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile($zip, 'OnlyErrorDialogs', 'SendToRecycleBin')
+        throw "FFmpeg download failed its checksum.`n  expected $ffmpegSha256`n  got      $actual"
+    }
+    Write-Host ("  sha256 ok  {0}" -f $actual)
 
     $staging = Join-Path $env:TEMP 'finnCrop-ffmpeg-unpack'
     if (Test-Path $staging) {
@@ -139,7 +163,7 @@ function Get-VendorBinaries {
 
     Add-Type -AssemblyName Microsoft.VisualBasic
     [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory($staging, 'OnlyErrorDialogs', 'SendToRecycleBin')
-    Remove-Item $zip -Force
+    [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile($zip, 'OnlyErrorDialogs', 'SendToRecycleBin')
 }
 
 Get-VendorBinaries

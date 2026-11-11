@@ -94,8 +94,11 @@ The mode is picked for you and shown under the controls:
 into the program as well, under *About*.
 
 FFmpeg is **not** covered by that licence. It is packed in under the GNU GPL v3
-and runs as a separate process; its source is at [ffmpeg.org](https://ffmpeg.org).
-See [THIRD-PARTY.md](THIRD-PARTY.md).
+and runs as a separate process, which is what keeps the program itself Apache 2.0.
+The build pins FFmpeg 9.0.2 and checks its SHA256, the licence text travels with
+the exe, and the exact corresponding source is named in
+[THIRD-PARTY.md](THIRD-PARTY.md) — which also covers the fonts the UI toolkit
+embeds.
 
 ## Build from source
 
@@ -112,8 +115,10 @@ Rust with the `x86_64-pc-windows-gnu` toolchain:
 the build's name, the exe's version block, the title bar and the About window.
 The result is `dist\finnCrop_v1.1.exe`, about 205 MB with FFmpeg inside.
 
-The first build downloads FFmpeg once (about 110 MB) into `vendor\` and packs it
-into the executable. The script looks for cargo in `%USERPROFILE%\.cargo\bin`
+The first build downloads FFmpeg once (about 110 MB), from the one pinned 9.0.2
+package, and packs it into the executable. The download is checked against a
+fixed SHA256 before it is unpacked, so a rebuild of the same version really does
+carry the same binaries. The script looks for cargo in `%USERPROFILE%\.cargo\bin`
 itself, so a rustup install that left that folder off PATH is still fine.
 
 Tests use the `vendor\` copies:
