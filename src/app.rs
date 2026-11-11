@@ -1027,9 +1027,21 @@ impl App {
                 ui.add_space(6.0);
                 ui.label(RichText::new("FFmpeg").strong());
                 ui.label(
-                    "FFmpeg and ffprobe travel inside this program and are started as separate \
-                     processes. FFmpeg is licensed under the GNU General Public License v3; its \
-                     source code is at ffmpeg.org.",
+                    "FFmpeg and ffprobe are packed inside this program and started as separate \
+                     processes, which is what keeps finnCrop's own terms Apache 2.0. FFmpeg is \
+                     licensed under the GNU General Public License v3; the version this build \
+                     carries, and the source corresponding to it, are named in THIRD-PARTY.md, \
+                     and the licence text is written beside the binaries in the folder below.",
+                );
+                // Selectable, so the address can be copied out of the window by
+                // someone who has only the exe and cannot see the file itself.
+                ui.add(
+                    egui::Label::new(
+                        RichText::new("github.com/finnuen/finnCrop/blob/main/THIRD-PARTY.md")
+                            .monospace()
+                            .weak(),
+                    )
+                    .selectable(true),
                 );
                 if let Some(bins) = self.bins() {
                     let dir = bins
