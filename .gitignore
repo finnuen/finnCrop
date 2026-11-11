@@ -1,0 +1,5 @@
+/target
+/dist
+# FFmpeg is downloaded by build.ps1 and packed into the executable; it does not
+# need to be in the repository.
+/vendor/
