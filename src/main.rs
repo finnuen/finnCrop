@@ -9,11 +9,11 @@ mod timeline;
 /// The program's name, spelled the one way it is spelled everywhere.
 pub const APP_NAME: &str = "finnCrop";
 
-/// `1.1`. Cargo only accepts three-part versions, so Cargo.toml carries
-/// `1.1.0` and build.rs trims the trailing part once, here.
+/// `1.2`. Cargo only accepts three-part versions, so Cargo.toml carries
+/// `1.2.0` and build.rs trims the trailing part once, here.
 pub const VERSION: &str = env!("FINN_CROP_VERSION");
 
-/// What the title bar and the About window say: `finnCrop v1.1`.
+/// What the title bar and the About window say: `finnCrop v1.2`.
 pub fn version_line() -> String {
     format!("{APP_NAME} v{VERSION}")
 }

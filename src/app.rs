@@ -271,6 +271,30 @@ impl App {
         });
     }
 
+    /// Put the window back to how it starts: nothing open, nothing drawn,
+    /// nothing pending. The generation counter is what makes that final: a
+    /// probe or a frame already on its way arrives with the old number and is
+    /// ignored, so it cannot paint itself over the empty window afterwards.
+    ///
+    /// Output preferences (format, quality, precise cut, metadata, snapping)
+    /// are deliberately left alone; clearing a file is not a reset of choices.
+    fn clear(&mut self) {
+        self.stop_playback();
+        self.gen += 1;
+        self.loading = false;
+        self.info = None;
+        self.texture = None;
+        self.keyframes.clear();
+        self.pending_t = None;
+        self.drag = None;
+        self.notice = None;
+        self.crop = CropRect::full(1.0, 1.0);
+        self.aspect = Aspect::Free;
+        self.pos = 0.0;
+        self.start = 0.0;
+        self.end = 0.0;
+    }
+
     fn handle_msgs(&mut self, ctx: &egui::Context) {
         while let Ok(m) = self.rx.try_recv() {
             match m {
@@ -577,6 +601,18 @@ impl App {
                 if let Some(p) = pick_video() {
                     self.open(ctx, p);
                 }
+            }
+            // Clear sits to the right of the picker and is always laid out:
+            // with no file it is greyed out rather than gone, so the row never
+            // rearranges itself under the pointer. A file still being read
+            // counts as open, so a slow or wrong pick can be undone.
+            let has_file = self.info.is_some() || self.loading;
+            if ui
+                .add_enabled(!busy && has_file, egui::Button::new("Clear"))
+                .on_hover_text("Close this file and go back to the drop area")
+                .clicked()
+            {
+                self.clear();
             }
             if let Some(info) = &self.info {
                 let name = info.path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
@@ -1135,6 +1171,62 @@ mod tests {
         assert!((app.pos - 1.0).abs() < 0.001, "restarted at {}", app.pos);
         app.stop_playback();
         assert!(!app.is_playing());
+    }
+
+    #[test]
+    fn clear_returns_the_window_to_the_drop_area() {
+        let ctx = egui::Context::default();
+        let mut app = App::with_ctx(&ctx);
+        let mut t = 0.0;
+        step(&mut app, &ctx, &mut t, vec![]);
+        wait_until(&mut app, &ctx, &mut t, "ffmpeg", |a| a.bins().is_some());
+
+        let src = make_src();
+        app.open(&ctx, src.clone());
+        wait_until(&mut app, &ctx, &mut t, "preview", |a| a.info.is_some() && a.texture.is_some());
+
+        // Something to clear: a crop, a trim, a playhead.
+        app.crop = CropRect { x0: 10.0, y0: 10.0, x1: 320.0, y1: 180.0 };
+        app.start = 1.0;
+        app.end = 2.0;
+        app.pos = 1.5;
+
+        app.clear();
+        step(&mut app, &ctx, &mut t, vec![]);
+        assert!(app.info.is_none(), "the file is gone");
+        assert!(app.texture.is_none(), "the picture is gone");
+        assert!(!app.loading, "clearing is not a load");
+        assert!(app.keyframes.is_empty());
+        assert!(app.pending_t.is_none());
+        assert!(app.plan().is_none(), "with no file there is nothing to export");
+        assert_eq!(app.title, version_line(), "the title bar drops the file name");
+
+        // Clearing must leave nothing stuck behind: opening again still works.
+        app.open(&ctx, src);
+        wait_until(&mut app, &ctx, &mut t, "preview after reopening", |a| a.info.is_some() && a.texture.is_some());
+    }
+
+    #[test]
+    fn clear_while_loading_drops_the_late_probe() {
+        let ctx = egui::Context::default();
+        let mut app = App::with_ctx(&ctx);
+        let mut t = 0.0;
+        step(&mut app, &ctx, &mut t, vec![]);
+        wait_until(&mut app, &ctx, &mut t, "ffmpeg", |a| a.bins().is_some());
+
+        app.open(&ctx, make_src());
+        assert!(app.loading);
+        app.clear();
+
+        // The probe started before Clear is still running; its answer must be
+        // thrown away when it arrives rather than reopening the file.
+        std::thread::sleep(Duration::from_secs(3));
+        for _ in 0..20 {
+            step(&mut app, &ctx, &mut t, vec![]);
+            assert!(!app.loading, "a cleared window must not show a spinner");
+        }
+        assert!(app.info.is_none(), "a probe from before Clear reopened the file");
+        assert!(app.texture.is_none(), "a frame from before Clear was drawn");
     }
 
     #[test]
