@@ -1011,7 +1011,7 @@ impl App {
             .show(ctx, |ui| {
                 ui.heading(version_line());
                 ui.add_space(2.0);
-                ui.label("Lossless cutting and cropping for video files.");
+                ui.label("Cutting and cropping for video files.");
                 ui.label(RichText::new("Copyright 2026 finnuen. Apache License 2.0.").weak());
 
                 ui.add_space(10.0);

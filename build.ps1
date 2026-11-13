@@ -5,12 +5,12 @@
 #  builds, and copies the result to dist\ under a name that says which build it
 #  is:
 #
-#      dist\finnCrop_v1.4.exe
+#      dist\finnCrop_v1.5.exe
 #
 #  finnCrop publishes two digits, so the last digit that moves is the minor one
-#  (1.4 -> 1.5). Cargo itself insists on three parts, which is why Cargo.toml
-#  reads "1.4.0" and the trailing part is always zero; build.rs trims it back to
-#  "1.4" for the title bar, the About window and the version block.
+#  (1.5 -> 1.6). Cargo itself insists on three parts, which is why Cargo.toml
+#  reads "1.5.0" and the trailing part is always zero; build.rs trims it back to
+#  "1.5" for the title bar, the About window and the version block.
 #
 #  Usage:
 #    .\build.ps1                  release build, version bumped
