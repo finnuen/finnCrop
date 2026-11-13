@@ -383,8 +383,11 @@ pub fn copy_compat(info: &VideoInfo, out_ext: &str) -> Option<String> {
         ) || (out_ext == "mov" && info.v_codec == "prores");
         let a_ok = match &info.a_codec {
             None => true,
+            // Opus and Vorbis are not copied, they are converted to AAC (see
+            // `audio_needs_aac`), so they belong here: a file that only needs
+            // its audio converted is one this can still produce.
             Some(a) => {
-                matches!(a.as_str(), "aac" | "mp3" | "mp2" | "ac3" | "eac3" | "alac" | "flac")
+                matches!(a.as_str(), "aac" | "mp3" | "mp2" | "ac3" | "eac3" | "alac" | "flac" | "opus" | "vorbis")
                     || (out_ext == "mov" && a.starts_with("pcm"))
             }
         };
@@ -915,5 +918,18 @@ mod tests {
         assert!(copy_compat(&i, "mkv").is_none());
         i.v_codec = "h264".into();
         assert!(copy_compat(&i, "mp4").is_none());
+
+        // AV1 with Opus is the pair that made a file look uncopyable: the video
+        // is fine as it is, and the audio is converted to AAC, so nothing here
+        // should stop the save.
+        i.v_codec = "av1".into();
+        i.a_codec = Some("opus".into());
+        assert!(copy_compat(&i, "mp4").is_none(), "av1/opus into mp4 is handled");
+        assert!(audio_needs_aac(&i, "mp4"), "and that is what handles it");
+        assert!(!audio_needs_aac(&i, "mkv"), "MKV keeps Opus as it is");
+
+        // Audio nothing can rescue still has to be refused.
+        i.a_codec = Some("wmav2".into());
+        assert!(copy_compat(&i, "mp4").is_some());
     }
 }
