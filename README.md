@@ -6,7 +6,7 @@
 
 **Crop a region of a video and cut it - exactly where you asked.**
 
-![version](https://img.shields.io/badge/version-1.3-blue)
+![version](https://img.shields.io/badge/version-1.4-blue)
 ![licence](https://img.shields.io/badge/licence-Apache--2.0-blue)
 ![platform](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-lightgrey)
 ![download](https://img.shields.io/badge/download-204%20MB-lightgrey)
@@ -26,7 +26,7 @@ with x264 and the audio is copied untouched wherever the container allows it,
 so only what has to change does.
 
 It is also one file. FFmpeg and ffprobe travel inside the exe and are unpacked
-once to `%LOCALAPPDATA%\finnCrop\ffmpeg\1.3\`, so there is no installer, no
+once to `%LOCALAPPDATA%\finnCrop\ffmpeg\1.4\`, so there is no installer, no
 admin rights, and no DLL sitting beside it.
 
 ## Download
@@ -63,7 +63,7 @@ The mode is picked for you and shown under the controls:
 
 | Mode | When | What it does |
 | --- | --- | --- |
-| **Cut** | always | picture re-encoded with x264, audio copied (converted to AAC in MKV), quality selectable |
+| **Cut** | always | picture re-encoded with x264, audio copied unless *Keep audio* is off (converted to AAC in MKV), quality selectable |
 | **Crop** | the box is smaller than the frame | the same, plus the picture is cropped |
 | **GIF** | format *GIF* | re-encoded to a palette, loops forever, no sound, no metadata |
 
@@ -81,6 +81,8 @@ The mode is picked for you and shown under the controls:
 - **Codecs.** If the source codecs cannot be copied into the chosen container —
   some AVI or WMV audio into MP4, for instance — the app says so. Choose MKV, or
   *Same as source*.
+- **Keep audio off** writes the file without an audio track at all, not a silent one.
+  With nothing else changed the picture is remuxed rather than re-encoded.
 - **Keep metadata OFF** removes tags (title, creation date, GPS, encoder name)
   and chapters. With nothing else changed it just remuxes, so it stays lossless.
   When the picture is re-encoded the x264 settings string is removed with it.
@@ -108,7 +110,7 @@ embeds.
 Rust with the `x86_64-pc-windows-gnu` toolchain:
 
 ```powershell
-.\build.ps1                 # release build, version bumped (1.3 -> 1.4)
+.\build.ps1                 # release build, version bumped (1.4 -> 1.5)
 .\build.ps1 -Debug          # debug build, fast, ffmpeg read from vendor\
 .\build.ps1 -KeepVersion    # rebuild the same version
 .\build.ps1 -Version 2.0    # set the version outright
@@ -116,7 +118,7 @@ Rust with the `x86_64-pc-windows-gnu` toolchain:
 
 `Cargo.toml` holds the version and nothing else does; the script writes it into
 the build's name, the exe's version block, the title bar and the About window.
-The result is `dist\finnCrop_v1.3.exe`, about 205 MB with FFmpeg inside.
+The result is `dist\finnCrop_v1.4.exe`, about 205 MB with FFmpeg inside.
 
 The first build downloads FFmpeg once (about 110 MB), from the one pinned 9.0.2
 package, and packs it into the executable. The download is checked against a

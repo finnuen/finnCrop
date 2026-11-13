@@ -479,6 +479,8 @@ pub struct Job {
     pub crf: u32,
     /// Re-encode audio to AAC instead of copying (used as a fallback).
     pub audio_aac: bool,
+    /// False drops the audio track entirely.
+    pub keep_audio: bool,
     /// Set for `Mode::Gif`.
     pub gif: Option<GifOpts>,
 }
@@ -493,12 +495,17 @@ pub fn build_args(job: &Job) -> Vec<OsString> {
     let mov_family = matches!(ext.as_str(), "mp4" | "m4v" | "mov");
 
     push_args!(a; "-hide_banner", "-loglevel", "error", "-y", "-ss", fmt_secs(job.start), "-i", job.input.clone());
-    push_args!(a; "-t", fmt_secs(job.dur), "-map", "0:v:0", "-map", "0:a?");
+    push_args!(a; "-t", fmt_secs(job.dur), "-map", "0:v:0");
+    if job.keep_audio {
+        push_args!(a; "-map", "0:a?");
+    }
 
     match job.mode {
         Mode::Remux => {
             push_args!(a; "-c", "copy");
-            if job.audio_aac {
+            if !job.keep_audio {
+                push_args!(a; "-an");
+            } else if job.audio_aac {
                 push_args!(a; "-c:a", "aac", "-b:a", "192k");
             }
             push_args!(a; "-avoid_negative_ts", "make_zero");
@@ -509,7 +516,9 @@ pub fn build_args(job: &Job) -> Vec<OsString> {
                 push_args!(a; "-vf", format!("crop={w}:{h}:{x}:{y}"));
             }
             push_args!(a; "-c:v", "libx264", "-crf", job.crf.to_string(), "-preset", "fast", "-pix_fmt", "yuv420p");
-            if job.audio_aac {
+            if !job.keep_audio {
+                push_args!(a; "-an");
+            } else if job.audio_aac {
                 push_args!(a; "-c:a", "aac", "-b:a", "192k");
             } else {
                 push_args!(a; "-c:a", "copy");
@@ -743,6 +752,7 @@ mod tests {
             keep_metadata: keep,
             crf: 23,
             audio_aac: false,
+            keep_audio: true,
             gif: None,
         }
     }
@@ -931,7 +941,6 @@ mod tests {
         assert_eq!(info.a_codec.as_deref(), Some("aac"));
     }
 
-    #[test]
     /// A cut into Matroska must start both streams at zero.
     ///
     /// When the audio is stream-copied, ffmpeg keeps the input timestamps on
@@ -966,6 +975,31 @@ mod tests {
         }
         let info = probe(&b, &out).unwrap();
         assert!((info.duration - 2.0).abs() < 0.2, "dur {}", info.duration);
+    }
+
+    #[test]
+    fn dropping_the_audio_writes_a_silent_file() {
+        let b = bins();
+        let src = make_video(); // has an AAC track
+        let c = AtomicBool::new(false);
+
+        // A cut without the sound.
+        let cut = tmp("silent_cut.mp4");
+        let mut j = job(&src, &cut, Mode::Video, 1.0, 2.0, None, true);
+        j.keep_audio = false;
+        export(&b, &j, &c, &|_| {}).unwrap();
+        let info = probe(&b, &cut).unwrap();
+        assert!(info.a_codec.is_none(), "the cut still has audio: {:?}", info.a_codec);
+        assert!((info.duration - 2.0).abs() < 0.2, "dur {}", info.duration);
+
+        // And a metadata-only remux without it, where the picture is copied.
+        let remux = tmp("silent_remux.mkv");
+        let mut j = job(&src, &remux, Mode::Remux, 0.0, 12.0, None, true);
+        j.keep_audio = false;
+        export(&b, &j, &c, &|_| {}).unwrap();
+        let info = probe(&b, &remux).unwrap();
+        assert!(info.a_codec.is_none(), "the remux still has audio: {:?}", info.a_codec);
+        assert_eq!(info.v_codec, "h264", "the picture should have been copied, not re-encoded");
     }
 
     #[test]

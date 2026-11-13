@@ -140,6 +140,7 @@ pub struct App {
     start: f64,
     end: f64,
     keep_metadata: bool,
+    keep_audio: bool,
     format: OutFormat,
     quality: Quality,
     export: Option<Exporting>,
@@ -213,6 +214,7 @@ impl App {
             start: 0.0,
             end: 0.0,
             keep_metadata: true,
+            keep_audio: true,
             format: OutFormat::Same,
             quality: Quality::High,
             export: None,
@@ -272,7 +274,7 @@ impl App {
     /// probe or a frame already on its way arrives with the old number and is
     /// ignored, so it cannot paint itself over the empty window afterwards.
     ///
-    /// Output preferences (format, quality, metadata)
+    /// Output preferences (format, quality, metadata, audio)
     /// are deliberately left alone; clearing a file is not a reset of choices.
     fn clear(&mut self) {
         self.stop_playback();
@@ -509,7 +511,7 @@ impl App {
         let dur = (self.end - eff_start).max(0.05);
         let warn = if mode == Mode::Remux { ffmpeg::copy_compat(info, &out_ext) } else { None };
         // GIF is always a re-encode, so there is always something to save.
-        let can_save = gif || cropped || trim_changed || !self.keep_metadata;
+        let can_save = gif || cropped || trim_changed || !self.keep_metadata || !self.keep_audio;
         let crop_px = if cropped { Some(self.crop.to_pixels(info.width, info.height)) } else { None };
         let (gw, gh) = match crop_px {
             Some((w, h, _, _)) => (w, h),
@@ -566,6 +568,7 @@ impl App {
             dur: plan.dur,
             crop: plan.crop_px,
             keep_metadata: self.keep_metadata,
+            keep_audio: self.keep_audio,
             crf: self.quality.crf(),
             // The audio is copied whenever it can be, except for two cases. One
             // is playback support: Opus and Vorbis in MP4. The other is
@@ -573,8 +576,9 @@ impl App {
             // it keep the input timestamps on the re-encoded video, so the
             // picture starts where the cut began while the sound starts at
             // zero, and the two sit however far the trim started from apart.
-            audio_aac: ffmpeg::audio_needs_aac(&info, &plan.out_ext)
-                || (plan.mode == Mode::Video && plan.out_ext == "mkv"),
+            audio_aac: self.keep_audio
+                && (ffmpeg::audio_needs_aac(&info, &plan.out_ext)
+                    || (plan.mode == Mode::Video && plan.out_ext == "mkv")),
             gif: plan.gif,
         };
         let cancel = Arc::new(AtomicBool::new(false));
@@ -913,6 +917,9 @@ impl App {
                     "Off: removes tags such as title, creation date, GPS location and encoder info.\nVideo and audio are not re-encoded just for this.",
                 )
                 .on_disabled_hover_text("A GIF has no place to keep the tags.");
+                ui.add_enabled(!gif, egui::Checkbox::new(&mut self.keep_audio, "Keep audio"))
+                    .on_hover_text("Off: the sound is dropped and the file is written without an audio track.")
+                    .on_disabled_hover_text("A GIF has no sound to keep.");
             });
         });
 
@@ -933,7 +940,7 @@ impl App {
             if p.trim_changed {
                 ui.label(RichText::new(format!("Output length {}", fmt_time(p.dur))).weak());
             }
-            if ffmpeg::audio_needs_aac(&info, &p.out_ext) {
+            if self.keep_audio && ffmpeg::audio_needs_aac(&info, &p.out_ext) {
                 ui.label(
                     RichText::new(format!(
                         "Audio is converted to AAC: {} in .{} plays in few players.",
