@@ -22,7 +22,8 @@ file on the window, drag the crop box, set the two ends of the trim, press Save.
 
 What makes it worth having is what happens next. The cut starts and ends exactly
 where the trim says, to the frame, whatever the file. The picture is re-encoded
-with x264 and the audio is copied untouched, so only what has to change does.
+with x264 and the audio is copied untouched wherever the container allows it,
+so only what has to change does.
 
 It is also one file. FFmpeg and ffprobe travel inside the exe and are unpacked
 once to `%LOCALAPPDATA%\finnCrop\ffmpeg\1.3\`, so there is no installer, no
@@ -62,7 +63,7 @@ The mode is picked for you and shown under the controls:
 
 | Mode | When | What it does |
 | --- | --- | --- |
-| **Cut** | always | picture re-encoded with x264, audio copied, quality selectable |
+| **Cut** | always | picture re-encoded with x264, audio copied (converted to AAC in MKV), quality selectable |
 | **Crop** | the box is smaller than the frame | the same, plus the picture is cropped |
 | **GIF** | format *GIF* | re-encoded to a palette, loops forever, no sound, no metadata |
 

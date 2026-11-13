@@ -567,7 +567,14 @@ impl App {
             crop: plan.crop_px,
             keep_metadata: self.keep_metadata,
             crf: self.quality.crf(),
-            audio_aac: ffmpeg::audio_needs_aac(&info, &plan.out_ext),
+            // The audio is copied whenever it can be, except for two cases. One
+            // is playback support: Opus and Vorbis in MP4. The other is
+            // Matroska, and it is ffmpeg's doing - a copied stream there makes
+            // it keep the input timestamps on the re-encoded video, so the
+            // picture starts where the cut began while the sound starts at
+            // zero, and the two sit however far the trim started from apart.
+            audio_aac: ffmpeg::audio_needs_aac(&info, &plan.out_ext)
+                || (plan.mode == Mode::Video && plan.out_ext == "mkv"),
             gif: plan.gif,
         };
         let cancel = Arc::new(AtomicBool::new(false));

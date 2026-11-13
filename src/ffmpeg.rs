@@ -932,6 +932,43 @@ mod tests {
     }
 
     #[test]
+    /// A cut into Matroska must start both streams at zero.
+    ///
+    /// When the audio is stream-copied, ffmpeg keeps the input timestamps on
+    /// the re-encoded video: the picture starts where the cut began while the
+    /// sound starts at zero, and the two are a trim-length apart. The app
+    /// therefore re-encodes the audio for MKV, and this is the test that keeps
+    /// that decision honest.
+    #[test]
+    fn an_mkv_cut_keeps_picture_and_sound_together() {
+        let b = bins();
+        let src = make_video(); // h264 + aac, mp4
+        let out = tmp("together.mkv");
+        let mut j = job(&src, &out, Mode::Video, 1.0, 2.0, None, true);
+        j.audio_aac = true;
+        let c = AtomicBool::new(false);
+        export(&b, &j, &c, &|_| {}).unwrap();
+
+        let o = Command::new(&b.ffprobe)
+            .args(["-v", "error", "-show_entries", "stream=codec_type,start_time", "-of", "csv=p=0"])
+            .arg(&out)
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&o.stdout).to_string();
+        let starts: Vec<f64> = text
+            .lines()
+            .filter_map(|l| l.split(',').nth(1))
+            .filter_map(|s| s.parse::<f64>().ok())
+            .collect();
+        assert_eq!(starts.len(), 2, "{text}");
+        for s in &starts {
+            assert!(s.abs() < 0.05, "a stream starts at {s} s, not at the cut: {text}");
+        }
+        let info = probe(&b, &out).unwrap();
+        assert!((info.duration - 2.0).abs() < 0.2, "dur {}", info.duration);
+    }
+
+    #[test]
     fn cancel_removes_partial_output() {
         let b = bins();
         let src = make_video();
