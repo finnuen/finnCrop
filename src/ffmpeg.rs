@@ -206,7 +206,8 @@ pub fn grab_frame(bins: &Bins, path: &Path, t: f64, w: u32, h: u32) -> Res<(usiz
 /// and previewing the picture is what this is for.
 ///
 /// One ffmpeg process decodes `from`..`until` and writes raw RGBA frames to a
-/// pipe, paced to the video's own frame rate by `-re`. A thread keeps only the
+/// pipe as fast as it can; the reader thread hands them on one per frame of the
+/// video's own rate, timed from the first one to arrive. A thread keeps only the
 /// newest frame, so the window never waits on the decoder: frames that arrive
 /// while the UI is busy are dropped, which is what playback should do anyway.
 ///
@@ -233,10 +234,22 @@ impl Player {
         until: f64,
         w: u32,
         h: u32,
+        fps: f64,
         on_frame: Arc<dyn Fn() + Send + Sync>,
-    ) -> Res<Self> {        let (pw, ph) = preview_size(w, h);
+    ) -> Res<Self> {
+        let (pw, ph) = preview_size(w, h);
+        // Deliberately no -re. It paces against the moment ffmpeg started, so a
+        // slow seek - which has to decode forward from the keyframe before the
+        // start point - leaves the first second of the clip overdue, and ffmpeg
+        // then flushes it out at up to twice the speed. That is the stutter at
+        // the top of playback on a file with long groups of pictures.
+        //
+        // Decoding is left unthrottled and the reader below hands frames on at
+        // the video's own rate, measured from the first frame that arrives: the
+        // wait for that frame stays (it is the seek), but the speed after it is
+        // right from the start.
         let mut child = command(&bins.ffmpeg)
-            .args(["-hide_banner", "-loglevel", "error", "-re", "-ss"])
+            .args(["-hide_banner", "-loglevel", "error", "-ss"])
             .arg(fmt_secs(from))
             .arg("-i")
             .arg(path)
@@ -264,11 +277,21 @@ impl Player {
                 let need = pw * ph * 4;
                 let mut buf = vec![0u8; need];
                 let mut reader = BufReader::with_capacity(need, stdout);
+                // One frame every 1/fps, counted from the first one to arrive.
+                let step = if fps.is_finite() && fps > 1.0 && fps < 1000.0 { 1.0 / fps } else { 1.0 / 30.0 };
+                let mut base: Option<std::time::Instant> = None;
+                let mut shown: u64 = 0;
                 while !cancel.load(Ordering::Relaxed) {
                     if reader.read_exact(&mut buf).is_err() {
                         break; // end of the slice, or ffmpeg was killed
                     }
-                    decoded.fetch_add(1, Ordering::Relaxed);
+                    let t0 = *base.get_or_insert_with(std::time::Instant::now);
+                    let due = t0 + std::time::Duration::from_secs_f64(step * shown as f64);
+                    if let Some(wait) = due.checked_duration_since(std::time::Instant::now()) {
+                        std::thread::sleep(wait);
+                    }
+                    shown += 1;
+                    decoded.store(shown, Ordering::Relaxed);
                     if let Ok(mut slot) = frame.lock() {
                         *slot = Some((pw, ph, buf.clone()));
                     }
@@ -793,11 +816,39 @@ mod tests {
         assert!(kf.len() >= 6 && kf[0].abs() < 0.01 && (kf[1] - 2.0).abs() < 0.05, "{kf:?}");
     }
 
+    /// Playback has to run at the video's speed from its first frame, not race
+    /// through the head to catch up with a slow seek.
+    #[test]
+    fn playback_starts_at_the_video_rate() {
+        let b = bins();
+        let src = make_video(); // 30 fps
+        let mut p = Player::start(&b, &src, 0.0, 6.0, 640, 360, 30.0, Arc::new(|| {})).unwrap();
+
+        let n = 30; // one second of video
+        let start = std::time::Instant::now();
+        let mut seen = 0;
+        while seen < n && start.elapsed() < std::time::Duration::from_secs(20) {
+            if p.take_frame().is_some() {
+                seen += 1;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let took = start.elapsed().as_secs_f64();
+        p.stop();
+
+        assert!(seen >= n, "only {seen} frames arrived");
+        assert!(
+            took > 0.75,
+            "{n} frames of a 30 fps clip arrived in {took:.2} s - the head is being flushed at speed"
+        );
+        assert!(took < 3.0, "{n} frames took {took:.2} s - playback is too slow");
+    }
+
     #[test]
     fn player_delivers_frames() {
         let b = bins();
         let src = make_video();
-        let mut p = Player::start(&b, &src, 2.0, 4.0, 640, 360, Arc::new(|| {})).unwrap();
+        let mut p = Player::start(&b, &src, 2.0, 4.0, 640, 360, 30.0, Arc::new(|| {})).unwrap();
 
         let wait = std::time::Duration::from_secs(15);
         let mut first = None;

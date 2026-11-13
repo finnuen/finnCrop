@@ -423,7 +423,7 @@ impl App {
 
         let ctx2 = ctx.clone();
         let repaint: Arc<dyn Fn() + Send + Sync> = Arc::new(move || ctx2.request_repaint());
-        match ffmpeg::Player::start(&bins, &info.path, self.pos, self.end, info.width, info.height, repaint) {
+        match ffmpeg::Player::start(&bins, &info.path, self.pos, self.end, info.width, info.height, info.fps, repaint) {
             Ok(p) => {
                 self.player = Some(p);
                 self.notice = None;
