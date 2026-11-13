@@ -4,9 +4,9 @@
 
 # finnCrop
 
-**Crop a region of a video and cut it — losslessly, where the format allows.**
+**Crop a region of a video and cut it - exactly where you asked.**
 
-![version](https://img.shields.io/badge/version-1.2-blue)
+![version](https://img.shields.io/badge/version-1.3-blue)
 ![licence](https://img.shields.io/badge/licence-Apache--2.0-blue)
 ![platform](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-lightgrey)
 ![download](https://img.shields.io/badge/download-204%20MB-lightgrey)
@@ -20,14 +20,12 @@
 finnCrop is a video cropper that does not ask you to run a command line. Drop a
 file on the window, drag the crop box, set the two ends of the trim, press Save.
 
-What makes it worth having is what happens next. When the crop box covers the
-whole frame, finnCrop copies the streams instead of re-encoding them: a trim
-takes a second and loses nothing. Crop tighter than the frame and it re-encodes
-the picture with x264, but the audio is still copied untouched, so only what has
-to change does.
+What makes it worth having is what happens next. The cut starts and ends exactly
+where the trim says, to the frame, whatever the file. The picture is re-encoded
+with x264 and the audio is copied untouched, so only what has to change does.
 
 It is also one file. FFmpeg and ffprobe travel inside the exe and are unpacked
-once to `%LOCALAPPDATA%\finnCrop\ffmpeg\1.2\`, so there is no installer, no
+once to `%LOCALAPPDATA%\finnCrop\ffmpeg\1.3\`, so there is no installer, no
 admin rights, and no DLL sitting beside it.
 
 ## Download
@@ -64,16 +62,16 @@ The mode is picked for you and shown under the controls:
 
 | Mode | When | What it does |
 | --- | --- | --- |
-| **Fast cut** | the box covers the whole frame | streams are copied — no re-encoding, lossless, near-instant |
-| **Crop** | the box is smaller than the frame | picture re-encoded with x264, audio copied, quality selectable |
-| **Precise cut** | *Precise cut* is ticked | frame-accurate trim by re-encoding, no crop needed |
+| **Cut** | always | picture re-encoded with x264, audio copied, quality selectable |
+| **Crop** | the box is smaller than the frame | the same, plus the picture is cropped |
 | **GIF** | format *GIF* | re-encoded to a palette, loops forever, no sound, no metadata |
 
 ## Notes
 
-- **Fast cut starts on a keyframe.** *Snap start to keyframe* (on by default)
-  begins at the keyframe at or before your start point, so the result is clean.
-  Turn it off, or use Precise cut, if you need the exact frame.
+- **A cut is exact.** It begins and ends on the frames the trim points at,
+  whatever the file. That costs a re-encode of the picture: a lossless copy
+  cannot start anywhere except on a keyframe, and keyframes can be seconds
+  apart, which would make the clip longer than the range you selected.
 - **GIF quality moves three things at once** — frame rate (15 / 12 / 10 fps),
   long side (800 / 640 / 480 px) and palette (256 / 192 / 128 colours). The
   picture is only ever made smaller, never bigger. A GIF is encoded in two
@@ -84,9 +82,11 @@ The mode is picked for you and shown under the controls:
   *Same as source*.
 - **Keep metadata OFF** removes tags (title, creation date, GPS, encoder name)
   and chapters. With nothing else changed it just remuxes, so it stays lossless.
-  In fast cut the original video and audio data is copied untouched, so anything
-  embedded inside the stream itself stays; MKV keeps a generic `Lavf` marker.
-  Re-encoded output has the x264 settings string removed.
+  When the picture is re-encoded the x264 settings string is removed with it.
+- **Opus and Vorbis in MP4.** The container allows them; most Windows players do
+  not, and open the file to a still frame. When the output is MP4 or MOV the
+  audio is converted to AAC instead, and the controls say so. MKV carries them
+  as they are.
 - **Subtitles and extra video streams are not copied** — first video plus all
   audio only.
 
@@ -107,7 +107,7 @@ embeds.
 Rust with the `x86_64-pc-windows-gnu` toolchain:
 
 ```powershell
-.\build.ps1                 # release build, version bumped (1.2 -> 1.3)
+.\build.ps1                 # release build, version bumped (1.3 -> 1.4)
 .\build.ps1 -Debug          # debug build, fast, ffmpeg read from vendor\
 .\build.ps1 -KeepVersion    # rebuild the same version
 .\build.ps1 -Version 2.0    # set the version outright
@@ -115,7 +115,7 @@ Rust with the `x86_64-pc-windows-gnu` toolchain:
 
 `Cargo.toml` holds the version and nothing else does; the script writes it into
 the build's name, the exe's version block, the title bar and the About window.
-The result is `dist\finnCrop_v1.2.exe`, about 205 MB with FFmpeg inside.
+The result is `dist\finnCrop_v1.3.exe`, about 205 MB with FFmpeg inside.
 
 The first build downloads FFmpeg once (about 110 MB), from the one pinned 9.0.2
 package, and packs it into the executable. The download is checked against a

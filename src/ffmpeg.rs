@@ -365,6 +365,15 @@ pub fn keyframes(bins: &Bins, path: &Path) -> Res<Vec<f64>> {
 }
 
 /// Is stream copy into this container likely to work? Returns a message if not.
+/// Audio that the container allows but common players on Windows do not:
+/// Opus and Vorbis inside .mp4/.mov. Copying them yields a file that finnCrop
+/// plays and the system player may open to a still frame, so the audio is
+/// converted to AAC instead.
+pub fn audio_needs_aac(info: &VideoInfo, out_ext: &str) -> bool {
+    let mov_family = matches!(out_ext, "mp4" | "m4v" | "mov");
+    mov_family && matches!(info.a_codec.as_deref(), Some("opus") | Some("vorbis"))
+}
+
 pub fn copy_compat(info: &VideoInfo, out_ext: &str) -> Option<String> {
     let mov_family = matches!(out_ext, "mp4" | "m4v" | "mov");
     if mov_family {
@@ -375,13 +384,13 @@ pub fn copy_compat(info: &VideoInfo, out_ext: &str) -> Option<String> {
         let a_ok = match &info.a_codec {
             None => true,
             Some(a) => {
-                matches!(a.as_str(), "aac" | "mp3" | "mp2" | "ac3" | "eac3" | "opus" | "alac" | "flac")
+                matches!(a.as_str(), "aac" | "mp3" | "mp2" | "ac3" | "eac3" | "alac" | "flac")
                     || (out_ext == "mov" && a.starts_with("pcm"))
             }
         };
         if !v_ok || !a_ok {
             return Some(format!(
-                "Can't copy {}{} into .{out_ext} without re-encoding. Choose MKV or \"Same as source\", or turn on Precise cut.",
+                "Can't copy {}{} into .{out_ext} without re-encoding. Choose MKV or \"Same as source\".",
                 info.v_codec,
                 info.a_codec.as_ref().map(|a| format!("/{a}")).unwrap_or_default()
             ));
@@ -398,12 +407,17 @@ pub fn copy_compat(info: &VideoInfo, out_ext: &str) -> Option<String> {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Mode {
-    /// Stream copy: no re-encode.
-    FastCut,
-    /// Re-encode the full frame (frame-accurate trim).
-    Precise,
-    /// Crop filter + re-encode.
-    Crop,
+    /// Re-encode the picture, with an optional crop; the audio is copied.
+    ///
+    /// Every cut goes through here. A stream copy can only begin on a keyframe,
+    /// so it cannot start where the trim says unless the trim happens to land
+    /// on one; re-encoding can, and cutting where it was asked matters more
+    /// than the time a copy would save.
+    Video,
+    /// Streams copied without seeking. Only for stripping metadata when the
+    /// picture is otherwise untouched: no cut, no crop, so there is nothing to
+    /// seek to and nothing that can land in the wrong place.
+    Remux,
     /// Animated GIF: palette built in one pass, encoded in a second.
     Gif,
 }
@@ -456,11 +470,15 @@ pub fn build_args(job: &Job) -> Vec<OsString> {
     push_args!(a; "-t", fmt_secs(job.dur), "-map", "0:v:0", "-map", "0:a?");
 
     match job.mode {
-        Mode::FastCut => {
-            push_args!(a; "-c", "copy", "-avoid_negative_ts", "make_zero");
+        Mode::Remux => {
+            push_args!(a; "-c", "copy");
+            if job.audio_aac {
+                push_args!(a; "-c:a", "aac", "-b:a", "192k");
+            }
+            push_args!(a; "-avoid_negative_ts", "make_zero");
         }
         Mode::Gif => unreachable!("GIF exports are built by gif_args()"),
-        Mode::Precise | Mode::Crop => {
+        Mode::Video => {
             if let Some((w, h, x, y)) = job.crop {
                 push_args!(a; "-vf", format!("crop={w}:{h}:{x}:{y}"));
             }
@@ -482,7 +500,7 @@ pub fn build_args(job: &Job) -> Vec<OsString> {
         push_args!(a; "-map_metadata", "-1", "-map_chapters", "-1");
         push_args!(a; "-map_metadata:s:v", "-1", "-map_metadata:s:a", "-1");
         push_args!(a; "-fflags", "+bitexact", "-flags:v", "+bitexact", "-flags:a", "+bitexact");
-        if job.mode != Mode::FastCut {
+        if job.mode == Mode::Video {
             // FFmpeg 6 still writes an "encoder" stream tag; a blank value suppresses it.
             // Also drop the x264 settings SEI so the bitstream doesn't carry encoder info.
             push_args!(a; "-metadata:s:v:0", "encoder= ", "-bsf:v", "filter_units=remove_types=6");
@@ -630,7 +648,7 @@ pub fn export(bins: &Bins, job: &Job, cancel: &AtomicBool, on_progress: &dyn Fn(
         return run_gif(bins, job, cancel, on_progress);
     }
     match run_export(bins, job, cancel, on_progress) {
-        Err(e) if e != CANCELLED && matches!(job.mode, Mode::Crop | Mode::Precise) && !job.audio_aac => {
+        Err(e) if e != CANCELLED && job.mode == Mode::Video && !job.audio_aac => {
             let mut j2 = job.clone();
             j2.audio_aac = true;
             run_export(bins, &j2, cancel, on_progress)
@@ -806,17 +824,18 @@ mod tests {
     }
 
     #[test]
-    fn fast_cut_is_lossless_and_right_length() {
+    fn a_cut_is_exactly_the_range_that_was_asked_for() {
         let b = bins();
         let src = make_video();
         let out = tmp("cut.mp4");
         let c = AtomicBool::new(false);
-        export(&b, &job(&src, &out, Mode::FastCut, 4.0, 5.0, None, true), &c, &|_| {}).unwrap();
+        // 4.0 to 9.0 on a file whose keyframes sit every 2 s: the start is
+        // nowhere near one, and the cut must still be exactly five seconds.
+        export(&b, &job(&src, &out, Mode::Video, 4.0, 5.0, None, true), &c, &|_| {}).unwrap();
         let info = probe(&b, &out).unwrap();
-        assert!((info.duration - 5.0).abs() < 0.35, "dur {}", info.duration);
+        assert!((info.duration - 5.0).abs() < 0.15, "dur {}", info.duration);
         assert_eq!(info.v_codec, "h264");
         assert_eq!((info.width, info.height), (640, 360));
-        // Stream copy: bitstream is not re-encoded, so no x264 settings are rewritten.
         let d = dump(&b, &out);
         assert!(d.contains("SecretTitle"), "metadata should be kept:\n{d}");
     }
@@ -827,9 +846,9 @@ mod tests {
         let src = make_video();
         let c = AtomicBool::new(false);
         for (name, mode, crop) in [
-            ("strip_copy.mp4", Mode::FastCut, None),
-            ("strip_crop.mp4", Mode::Crop, Some((320u32, 180u32, 10u32, 10u32))),
-            ("strip_copy.mkv", Mode::FastCut, None),
+            ("strip_copy.mp4", Mode::Remux, None),
+            ("strip_crop.mp4", Mode::Video, Some((320u32, 180u32, 10u32, 10u32))),
+            ("strip_copy.mkv", Mode::Remux, None),
         ] {
             let out = tmp(name);
             export(&b, &job(&src, &out, mode, 0.0, 12.0, crop, false), &c, &|_| {}).unwrap();
@@ -838,7 +857,7 @@ mod tests {
             for needle in ["secrettitle", "secretcomment", "12.3456", "streamsecret", "2019-03-04", "lavf5", "lavf6", "lavf7", "lavc", "libx264"] {
                 assert!(!tags.to_ascii_lowercase().contains(needle), "{name}: found {needle} in tags:\n{tags}");
             }
-            if mode == Mode::Crop {
+            if mode == Mode::Video {
                 let bytes = std::fs::read(&out).unwrap();
                 assert!(!bytes.windows(11).any(|w| w == b"x264 - core"), "{name}: x264 SEI still present");
             }
@@ -851,7 +870,7 @@ mod tests {
         let src = make_video();
         let out = tmp("crop.mp4");
         let c = AtomicBool::new(false);
-        export(&b, &job(&src, &out, Mode::Crop, 1.0, 4.0, Some((320, 180, 100, 50)), true), &c, &|_| {}).unwrap();
+        export(&b, &job(&src, &out, Mode::Video, 1.0, 4.0, Some((320, 180, 100, 50)), true), &c, &|_| {}).unwrap();
         let info = probe(&b, &out).unwrap();
         assert_eq!((info.width, info.height), (320, 180));
         assert!((info.duration - 4.0).abs() < 0.2, "dur {}", info.duration);
@@ -864,7 +883,7 @@ mod tests {
         let src = make_video();
         let out = tmp("cancel.mp4");
         let c = AtomicBool::new(true);
-        let r = export(&b, &job(&src, &out, Mode::Crop, 0.0, 12.0, Some((320, 180, 0, 0)), true), &c, &|_| {});
+        let r = export(&b, &job(&src, &out, Mode::Video, 0.0, 12.0, Some((320, 180, 0, 0)), true), &c, &|_| {});
         assert_eq!(r.unwrap_err(), CANCELLED);
         assert!(!out.exists());
     }
@@ -876,7 +895,7 @@ mod tests {
         let out = tmp("prog.mp4");
         let c = AtomicBool::new(false);
         let last = Mutex::new(0.0f32);
-        export(&b, &job(&src, &out, Mode::Crop, 0.0, 12.0, Some((320, 180, 0, 0)), true), &c, &|p| *last.lock().unwrap() = p).unwrap();
+        export(&b, &job(&src, &out, Mode::Video, 0.0, 12.0, Some((320, 180, 0, 0)), true), &c, &|p| *last.lock().unwrap() = p).unwrap();
         assert!(*last.lock().unwrap() > 0.99);
     }
 

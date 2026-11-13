@@ -139,8 +139,6 @@ pub struct App {
     pos: f64,
     start: f64,
     end: f64,
-    snap_start: bool,
-    precise: bool,
     keep_metadata: bool,
     format: OutFormat,
     quality: Quality,
@@ -214,8 +212,6 @@ impl App {
             pos: 0.0,
             start: 0.0,
             end: 0.0,
-            snap_start: true,
-            precise: false,
             keep_metadata: true,
             format: OutFormat::Same,
             quality: Quality::High,
@@ -276,7 +272,7 @@ impl App {
     /// probe or a frame already on its way arrives with the old number and is
     /// ignored, so it cannot paint itself over the empty window afterwards.
     ///
-    /// Output preferences (format, quality, precise cut, metadata, snapping)
+    /// Output preferences (format, quality, metadata)
     /// are deliberately left alone; clearing a file is not a reset of choices.
     fn clear(&mut self) {
         self.stop_playback();
@@ -481,14 +477,18 @@ impl App {
         let cropped = !self.crop.is_full(fw, fh);
         let trim_changed = self.start > 0.001 || self.end < info.duration - 0.001;
         let gif = self.format == OutFormat::Gif;
+        // Cutting re-encodes the picture. A stream copy can only begin on a
+        // keyframe, so it cannot start where the trim says unless the trim
+        // happens to land on one - and a cut that quietly becomes a different,
+        // longer clip is worse than one that takes a moment longer to write.
+        // The copy path is left for the one case that cannot go wrong: no cut
+        // and no crop, only the tags being rewritten.
         let mode = if gif {
             Mode::Gif
-        } else if cropped {
-            Mode::Crop
-        } else if self.precise && trim_changed {
-            Mode::Precise
+        } else if trim_changed || cropped {
+            Mode::Video
         } else {
-            Mode::FastCut
+            Mode::Remux
         };
 
         let out_ext = match self.format {
@@ -497,7 +497,7 @@ impl App {
             OutFormat::Mkv => "mkv".to_string(),
             OutFormat::Mov => "mov".to_string(),
             OutFormat::Same => {
-                if mode != Mode::FastCut && !matches!(info.ext.as_str(), "mp4" | "m4v" | "mov" | "mkv") {
+                if mode == Mode::Video && !matches!(info.ext.as_str(), "mp4" | "m4v" | "mov" | "mkv") {
                     "mp4".to_string()
                 } else {
                     info.ext.clone()
@@ -505,14 +505,9 @@ impl App {
             }
         };
 
-        let mut eff_start = self.start;
-        if mode == Mode::FastCut && self.snap_start {
-            if let Some(k) = self.keyframes.iter().rev().find(|&&k| k <= self.start + 0.001) {
-                eff_start = *k;
-            }
-        }
+        let eff_start = self.start;
         let dur = (self.end - eff_start).max(0.05);
-        let warn = if mode == Mode::FastCut { ffmpeg::copy_compat(info, &out_ext) } else { None };
+        let warn = if mode == Mode::Remux { ffmpeg::copy_compat(info, &out_ext) } else { None };
         // GIF is always a re-encode, so there is always something to save.
         let can_save = gif || cropped || trim_changed || !self.keep_metadata;
         let crop_px = if cropped { Some(self.crop.to_pixels(info.width, info.height)) } else { None };
@@ -572,7 +567,7 @@ impl App {
             crop: plan.crop_px,
             keep_metadata: self.keep_metadata,
             crf: self.quality.crf(),
-            audio_aac: false,
+            audio_aac: ffmpeg::audio_needs_aac(&info, &plan.out_ext),
             gif: plan.gif,
         };
         let cancel = Arc::new(AtomicBool::new(false));
@@ -894,7 +889,7 @@ impl App {
                         ui.selectable_value(&mut self.format, f, f.label());
                     }
                 });
-                let reencode = plan.as_ref().map(|p| p.mode != Mode::FastCut).unwrap_or(false);
+                let reencode = plan.as_ref().map(|p| p.mode == Mode::Video).unwrap_or(false);
                 ui.add_enabled_ui(reencode, |ui| {
                     egui::ComboBox::from_id_salt("quality").selected_text(self.quality.label()).show_ui(ui, |ui| {
                         for q in [Quality::High, Quality::Medium, Quality::Small] {
@@ -911,51 +906,34 @@ impl App {
                     "Off: removes tags such as title, creation date, GPS location and encoder info.\nVideo and audio are not re-encoded just for this.",
                 )
                 .on_disabled_hover_text("A GIF has no place to keep the tags.");
-                let cropped = plan.as_ref().map(|p| p.cropped).unwrap_or(false);
-                ui.add_enabled(
-                    !cropped && !gif,
-                    egui::Checkbox::new(&mut self.precise, "Precise cut (re-encode)"),
-                )
-                .on_hover_text("Frame-accurate trim, but slower and re-encodes the video.\nCropping always re-encodes.");
-                ui.add_enabled(
-                    !self.keyframes.is_empty() && !cropped && !self.precise && !gif,
-                    egui::Checkbox::new(&mut self.snap_start, "Snap start to keyframe"),
-                )
-                .on_hover_text("Fast cut can only start cleanly on a keyframe.\nOn: the cut starts at the keyframe at or before your start point.");
             });
         });
 
         ui.add_space(4.0);
-        // Mode summary.
+        // GIF is the only mode with something worth announcing: its size, rate
+        // and colour count are chosen by the quality step. A cut is just a cut.
         if let Some(p) = &plan {
-            let (text, color) = match p.mode {
-                Mode::Gif => {
-                    let g = p.gif.unwrap_or_default();
-                    (
-                        format!(
-                            "GIF: {} x {} at {} fps, {} colours, silent, loops forever. Re-encoded in two passes.",
-                            g.width, g.height, g.fps, g.colors
-                        ),
-                        Color32::from_rgb(240, 180, 90),
-                    )
-                }
-                Mode::Crop => ("Crop: the video is re-encoded (audio is copied).".to_string(), Color32::from_rgb(240, 180, 90)),
-                Mode::Precise => ("Precise cut: re-encoded, frame-accurate.".to_string(), Color32::from_rgb(240, 180, 90)),
-                Mode::FastCut if p.trim_changed => (
-                    "Fast cut: no re-encoding, lossless and near-instant.".to_string(),
-                    Color32::from_rgb(110, 200, 140),
-                ),
-                Mode::FastCut => ("No re-encoding: the streams are copied as they are.".to_string(), Color32::from_rgb(110, 200, 140)),
-            };
-            ui.horizontal_wrapped(|ui| {
-                ui.colored_label(color, text);
-                if p.trim_changed {
-                    ui.label(RichText::new(format!("Output length {}", fmt_time(p.dur))).weak());
-                }
-            });
-            if p.mode == Mode::FastCut && p.trim_changed && self.snap_start && (p.eff_start - self.start).abs() > 0.001 {
+            if let Mode::Gif = p.mode {
+                let g = p.gif.unwrap_or_default();
+                ui.colored_label(
+                    Color32::from_rgb(240, 180, 90),
+                    format!(
+                        "GIF: {} x {} at {} fps, {} colours, silent, loops forever. Re-encoded in two passes.",
+                        g.width, g.height, g.fps, g.colors
+                    ),
+                );
+            }
+            if p.trim_changed {
+                ui.label(RichText::new(format!("Output length {}", fmt_time(p.dur))).weak());
+            }
+            if ffmpeg::audio_needs_aac(&info, &p.out_ext) {
                 ui.label(
-                    RichText::new(format!("Start snaps to the keyframe at {}", fmt_time(p.eff_start))).weak(),
+                    RichText::new(format!(
+                        "Audio is converted to AAC: {} in .{} plays in few players.",
+                        info.a_codec.as_deref().unwrap_or("this audio"),
+                        p.out_ext
+                    ))
+                    .weak(),
                 );
             }
             if let Some(w) = &p.warn {
@@ -1300,7 +1278,7 @@ mod tests {
     }
 
     #[test]
-    fn full_flow_drag_crop_export_and_fast_cut() {
+    fn full_flow_drag_crop_export_and_cut() {
         let ctx = egui::Context::default();
         let mut app = App::with_ctx(&ctx);
         let mut t = 0.0;
@@ -1314,12 +1292,13 @@ mod tests {
         assert_eq!((info.width, info.height), (640, 360));
         assert!(app.disp.width() > 100.0 && app.scale > 0.0);
 
-        // Nothing changed: no re-encode, nothing to save (metadata kept).
+        // Nothing changed: nothing to save (metadata kept).
         let p = app.plan().unwrap();
-        assert_eq!(p.mode, Mode::FastCut);
+        assert_eq!(p.mode, Mode::Remux, "with no cut and no crop only the tags could change");
         assert!(!p.can_save);
         app.keep_metadata = false;
-        assert!(app.plan().unwrap().can_save, "stripping metadata alone is a valid (lossless) save");
+        assert!(app.plan().unwrap().can_save, "stripping metadata alone is a valid save");
+        assert_eq!(app.plan().unwrap().mode, Mode::Remux, "stripping tags does not need a re-encode");
         app.keep_metadata = true;
 
         // Drag the bottom-right crop handle up-left with the real pointer events.
@@ -1337,7 +1316,7 @@ mod tests {
         assert!(app.crop.y1 < 360.0 - 50.0 / scale * 0.9, "crop did not move: {:?}", app.crop);
         assert!(app.crop.x0 == 0.0 && app.crop.y0 == 0.0);
         let p = app.plan().unwrap();
-        assert_eq!(p.mode, Mode::Crop);
+        assert_eq!(p.mode, Mode::Video);
         let (cw, ch, _, _) = p.crop_px.unwrap();
 
         // Aspect preset snaps the box (then put the dragged box back).
@@ -1362,27 +1341,22 @@ mod tests {
         assert_eq!((oi.width, oi.height), (cw, ch));
         step(&mut app, &ctx, &mut t, vec![]); // renders the "Saved" notice
 
-        // Reset crop, trim 2.4 .. 6.0 with fast cut: start snaps back to the 2.0 keyframe.
+        // Reset crop and trim 2.4 .. 6.0. A cut always re-encodes, and it starts
+        // exactly where the trim says - no keyframe shifting.
         app.crop = CropRect::full(640.0, 360.0);
         app.start = 2.4;
         app.end = 6.0;
         let p = app.plan().unwrap();
-        assert_eq!(p.mode, Mode::FastCut);
-        assert!((p.eff_start - 2.0).abs() < 0.01, "eff_start {}", p.eff_start);
-        assert!((p.dur - 4.0).abs() < 0.01);
+        assert_eq!(p.mode, Mode::Video);
+        assert!((p.eff_start - 2.4).abs() < 0.001, "eff_start {}", p.eff_start);
+        assert!((p.dur - 3.6).abs() < 0.01, "dur {}", p.dur);
         let out2 = std::env::temp_dir().join("vc_ui_tests").join("ui_cut.mp4");
         let _ = std::fs::remove_file(&out2);
         app.begin_export(&ctx, out2.clone());
-        wait_until(&mut app, &ctx, &mut t, "fast cut export", |a| a.export.is_none());
+        wait_until(&mut app, &ctx, &mut t, "cut export", |a| a.export.is_none());
         let oi = ffmpeg::probe(&b, &out2).unwrap();
         assert_eq!((oi.width, oi.height, oi.v_codec.as_str()), (640, 360, "h264"));
-        assert!((oi.duration - 4.0).abs() < 0.3, "dur {}", oi.duration);
-
-        // Precise cut turns into a re-encode; snapping is off.
-        app.precise = true;
-        let p = app.plan().unwrap();
-        assert_eq!(p.mode, Mode::Precise);
-        assert!((p.eff_start - 2.4).abs() < 0.001);
+        assert!((oi.duration - 3.6).abs() < 0.2, "dur {}", oi.duration);
 
         // Opening a second file mid-session resets state.
         app.open(&ctx, src);
