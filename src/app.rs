@@ -310,8 +310,14 @@ impl App {
                             self.aspect = Aspect::Free;
                             self.start = 0.0;
                             self.end = info.duration;
-                            self.pos = if info.duration > 1.0 { (info.duration * 0.1).min(3.0) } else { 0.0 };
-                            self.pending_t = Some(self.pos);
+                            // The playhead starts where the trim does. It used
+                            // to jump ten percent in (three seconds at most)
+                            // to skip a black opening frame, but that put the
+                            // indicator somewhere the trim did not: the first
+                            // preview was a frame nobody asked for, and Play
+                            // began there instead of at the start.
+                            self.pos = 0.0;
+                            self.pending_t = Some(0.0);
                             if let Some(bins) = self.bins() {
                                 let (tx, ctx2, gen, path) = (self.tx.clone(), ctx.clone(), self.gen, info.path.clone());
                                 std::thread::spawn(move || {
@@ -1175,6 +1181,22 @@ mod tests {
         assert!((app.pos - 1.0).abs() < 0.001, "restarted at {}", app.pos);
         app.stop_playback();
         assert!(!app.is_playing());
+    }
+
+    #[test]
+    fn a_file_opens_with_the_playhead_at_the_start() {
+        let ctx = egui::Context::default();
+        let mut app = App::with_ctx(&ctx);
+        let mut t = 0.0;
+        step(&mut app, &ctx, &mut t, vec![]);
+        wait_until(&mut app, &ctx, &mut t, "ffmpeg", |a| a.bins().is_some());
+
+        app.open(&ctx, make_src());
+        wait_until(&mut app, &ctx, &mut t, "preview", |a| a.info.is_some() && a.texture.is_some());
+
+        assert_eq!(app.pos, 0.0, "the playhead should sit at the start, not ten percent in");
+        assert_eq!(app.start, 0.0);
+        assert!(app.end > 1.0);
     }
 
     #[test]
