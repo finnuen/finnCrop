@@ -4,7 +4,7 @@
 //! `Cargo.toml` holds the version and nothing else does. The number is
 //! `MAJOR.MINOR.PATCH` because Cargo wants three parts; finnCrop publishes two,
 //! so the trailing `.0` is trimmed here once and the rest of the program reads
-//! `FINN_CROP_VERSION` (`1.8`) or `CARGO_PKG_VERSION` (`1.8.0`).
+//! `FINN_CROP_VERSION` (`1.9`) or `CARGO_PKG_VERSION` (`1.9.0`).
 
 use std::path::PathBuf;
 
@@ -27,7 +27,7 @@ fn main() {
         return;
     }
 
-    // Four numbers, straight from the version: 1.8.0 -> 1,8,0,0.
+    // Four numbers, straight from the version: 1.9.0 -> 1,9,0,0.
     let mut parts = version.split('.').map(|p| p.parse::<u16>().unwrap_or(0));
     let (major, minor, patch) = (
         parts.next().unwrap_or(0),

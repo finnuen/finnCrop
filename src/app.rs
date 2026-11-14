@@ -831,9 +831,9 @@ impl App {
         // the bar below.
         let resp = ui.interact(disp.expand(6.0).intersect(area), ui.id().with("crop_area"), Sense::click_and_drag());
 
-        // The middle button belongs to the picture, not to the box: it pans and
+        // The right button belongs to the picture, not to the box: it pans and
         // nothing else, even when it is pressed on a handle.
-        let middle_held = ui.input(|i| i.pointer.button_down(egui::PointerButton::Middle));
+        let right_held = ui.input(|i| i.pointer.button_down(egui::PointerButton::Secondary));
 
         if !playing {
             // The wheel zooms around the pointer, so the pixel under it stays
@@ -850,9 +850,9 @@ impl App {
                     }
                 }
             }
-            // Middle-drag pans, the way an image viewer does.
+            // Right-drag pans, the way a map does.
             let (delta, pointer) = ui.input(|i| (i.pointer.delta(), i.pointer.interact_pos()));
-            if middle_held && pointer.is_some_and(|p| area.contains(p)) && self.zoom > 1.0 {
+            if right_held && pointer.is_some_and(|p| area.contains(p)) && self.zoom > 1.0 {
                 self.pan += delta;
             }
             // Keep the picture over the window: it cannot be dragged off into
@@ -912,7 +912,7 @@ impl App {
             let sr = to_screen(&self.crop);
             let hover = resp.hover_pos().and_then(|p| crop::hit_test(&sr, p.x, p.y, 10.0));
             // Only the primary button drags the box. egui reports a drag for
-            // every button, so without this a middle-drag would move the box
+            // every button, so without this a right-drag would move the box
             // while it panned the picture under it.
             let primary = egui::PointerButton::Primary;
             if resp.drag_started_by(primary) {
@@ -937,7 +937,7 @@ impl App {
             if resp.drag_stopped() {
                 self.drag = None;
             }
-            if let Some(h) = self.drag.map(|d| d.handle).or(hover).filter(|_| !middle_held) {
+            if let Some(h) = self.drag.map(|d| d.handle).or(hover).filter(|_| !right_held) {
                 ctx.set_cursor_icon(match h {
                     Handle::Move => CursorIcon::Move,
                     Handle::N | Handle::S => CursorIcon::ResizeVertical,
@@ -945,7 +945,7 @@ impl App {
                     Handle::NE | Handle::SW => CursorIcon::ResizeNeSw,
                     Handle::NW | Handle::SE => CursorIcon::ResizeNwSe,
                 });
-            } else if middle_held && self.zoom > 1.0 {
+            } else if right_held && self.zoom > 1.0 {
                 ctx.set_cursor_icon(CursorIcon::Grabbing);
             }
         }
@@ -1048,7 +1048,7 @@ impl App {
                     .on_hover_text(
                         "Preview only: draws whole pixels instead of a smoothed picture, and makes \
                          the crop edges land on whole pixels. The saved file is not affected.\n\
-                         Scroll over the picture to zoom; middle-drag pans a zoomed one.",
+                         Scroll over the picture to zoom; right-drag pans a zoomed one.",
                     )
                     .changed()
                     && !self.is_playing()
@@ -1470,10 +1470,10 @@ mod tests {
         assert!(zoomed > 1.1);
     }
 
-    /// egui reports a drag for every button, so a middle-drag over the box used
-    /// to move the box while it panned. The middle button is the picture's.
+    /// egui reports a drag for every button, so a right-drag over the box used
+    /// to move the box while it panned. The right button is the picture's.
     #[test]
-    fn a_middle_drag_pans_without_moving_the_box() {
+    fn a_right_drag_pans_without_moving_the_box() {
         let ctx = egui::Context::default();
         let mut app = App::with_ctx(&ctx);
         let mut t = 0.0;
@@ -1494,17 +1494,17 @@ mod tests {
             &mut app,
             &ctx,
             &mut t,
-            vec![Event::PointerButton { pos: start, button: PointerButton::Middle, pressed: true, modifiers: m }],
+            vec![Event::PointerButton { pos: start, button: PointerButton::Secondary, pressed: true, modifiers: m }],
         );
         step(&mut app, &ctx, &mut t, vec![Event::PointerMoved(end)]);
         step(
             &mut app,
             &ctx,
             &mut t,
-            vec![Event::PointerButton { pos: end, button: PointerButton::Middle, pressed: false, modifiers: m }],
+            vec![Event::PointerButton { pos: end, button: PointerButton::Secondary, pressed: false, modifiers: m }],
         );
 
-        assert_eq!(app.crop, before, "the middle button moved the crop box");
+        assert_eq!(app.crop, before, "the right button moved the crop box");
         assert!(app.pan.x > 0.0 && app.pan.y > 0.0, "the picture did not pan: {:?}", app.pan);
     }
 

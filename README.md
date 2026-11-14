@@ -6,7 +6,7 @@
 
 **Crop a region of a video and cut it - exactly where you asked.**
 
-![version](https://img.shields.io/badge/version-1.8-blue)
+![version](https://img.shields.io/badge/version-1.9-blue)
 ![licence](https://img.shields.io/badge/licence-Apache--2.0-blue)
 ![platform](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-lightgrey)
 ![download](https://img.shields.io/badge/download-204%20MB-lightgrey)
@@ -26,7 +26,7 @@ with x264 and the audio is copied untouched wherever the container allows it,
 so only what has to change does.
 
 It is also one file. FFmpeg and ffprobe travel inside the exe and are unpacked
-once to `%LOCALAPPDATA%\finnCrop\ffmpeg\1.8\`, so there is no installer, no
+once to `%LOCALAPPDATA%\finnCrop\ffmpeg\1.9\`, so there is no installer, no
 admin rights, and no DLL sitting beside it.
 
 ## Download
@@ -48,7 +48,7 @@ harmless — it is written again on the next start.
    right, closes the file and goes back to the empty window; it is dimmed while
    no file is open.
 2. **Crop** — drag the box or its handles. Aspect presets: 1:1, 16:9, 9:16, 4:3, 3:4.
-   Scroll over the picture to zoom in and out, and middle-drag to pan a zoomed
+   Scroll over the picture to zoom in and out, and right-drag to pan a zoomed
    one. *Disable video smoothing* is on to start with: the preview is drawn as
    whole pixels, like the picture actually is, and the crop edges land on whole
    pixels too. Neither is saved: the file is what the box says, smoothed or not.
@@ -115,7 +115,7 @@ embeds.
 Rust with the `x86_64-pc-windows-gnu` toolchain:
 
 ```powershell
-.\build.ps1                 # release build, version bumped (1.8 -> 1.9)
+.\build.ps1                 # release build, version bumped (1.9 -> 1.10)
 .\build.ps1 -Debug          # debug build, fast, ffmpeg read from vendor\
 .\build.ps1 -KeepVersion    # rebuild the same version
 .\build.ps1 -Version 2.0    # set the version outright
@@ -123,7 +123,7 @@ Rust with the `x86_64-pc-windows-gnu` toolchain:
 
 `Cargo.toml` holds the version and nothing else does; the script writes it into
 the build's name, the exe's version block, the title bar and the About window.
-The result is `dist\finnCrop_v1.8.exe`, about 205 MB with FFmpeg inside.
+The result is `dist\finnCrop_v1.9.exe`, about 205 MB with FFmpeg inside.
 
 The first build downloads FFmpeg once (about 110 MB), from the one pinned 9.0.2
 package, and packs it into the executable. The download is checked against a

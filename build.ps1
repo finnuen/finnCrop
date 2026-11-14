@@ -8,9 +8,9 @@
 #      dist\finnCrop_v<version>.exe
 #
 #  finnCrop publishes two digits, so the last digit that moves is the minor one
-#  (1.8 -> 1.9). Cargo itself insists on three parts, which is why Cargo.toml
-#  reads "1.8.0" and the trailing part is always zero; build.rs trims it back to
-#  "1.8" for the title bar, the About window and the version block.
+#  (1.9 -> 1.10). Cargo itself insists on three parts, which is why Cargo.toml
+#  reads "1.9.0" and the trailing part is always zero; build.rs trims it back to
+#  "1.9" for the title bar, the About window and the version block.
 #
 #  Usage:
 #    .\build.ps1                  release build, version bumped
