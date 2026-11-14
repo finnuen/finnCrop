@@ -156,6 +156,20 @@ fn clampf(v: f32, lo: f32, hi: f32) -> f32 {
     }
 }
 
+/// Put every edge on a whole video pixel, staying inside the frame and at
+/// least one pixel wide and high.
+///
+/// This is what "snap to pixel" means for the preview shown without smoothing:
+/// zoomed in, the edges then sit exactly on the grid the picture has, and the
+/// number in the crop read-out is the pixel the box starts at.
+pub fn snap(r: &mut CropRect, fw: f32, fh: f32) {
+    let x0 = r.x0.round().clamp(0.0, (fw - 1.0).max(0.0));
+    let y0 = r.y0.round().clamp(0.0, (fh - 1.0).max(0.0));
+    let x1 = r.x1.round().clamp(x0 + 1.0, fw.max(x0 + 1.0));
+    let y1 = r.y1.round().clamp(y0 + 1.0, fh.max(y0 + 1.0));
+    *r = CropRect { x0, y0, x1, y1 };
+}
+
 /// Apply a drag of (dx, dy) video pixels to the rectangle, keeping it inside the frame.
 /// `ratio` = Some(w/h) locks the aspect ratio.
 pub fn apply_drag(
@@ -311,5 +325,21 @@ mod tests {
         assert_eq!(hit_test(&r, 299.0, 150.0, 10.0), Some(Handle::E));
         assert_eq!(hit_test(&r, 200.0, 150.0, 10.0), Some(Handle::Move));
         assert_eq!(hit_test(&r, 500.0, 500.0, 10.0), None);
+    }
+
+    #[test]
+    fn snap_lands_on_whole_pixels_inside_the_frame() {
+        let mut r = CropRect { x0: 10.4, y0: 5.6, x1: 300.2, y1: 199.5 };
+        snap(&mut r, 640.0, 360.0);
+        assert_eq!((r.x0, r.y0, r.x1, r.y1), (10.0, 6.0, 300.0, 200.0));
+
+        // A box wider than the frame is pulled back in, one pixel at a time.
+        let mut r = CropRect { x0: -0.4, y0: 359.7, x1: 700.0, y1: 500.0 };
+        snap(&mut r, 640.0, 360.0);
+        assert!(inside(&r, 640.0, 360.0), "{r:?}");
+        assert!(r.x0 >= 0.0 && r.y1 <= 360.0);
+        assert_eq!(r.x0, 0.0);
+        assert_eq!(r.x1, 640.0);
+        assert_eq!((r.y0, r.y1), (359.0, 360.0), "a box pushed past the bottom is 1 px tall");
     }
 }

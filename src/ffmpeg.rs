@@ -174,14 +174,21 @@ pub fn fmt_secs(t: f64) -> String {
 
 /// Size of the preview frame (keeps aspect, max 1280 on the long side).
 pub fn preview_size(w: u32, h: u32) -> (usize, usize) {
+    fit_size(w, h, 1280)
+}
+
+/// The same, with the long side capped at `max_side` instead of 1280. A
+/// zoomed preview asks for more than 1280 so that one video pixel still has a
+/// pixel of its own on screen; it never goes past the source's own size.
+pub fn fit_size(w: u32, h: u32, max_side: u32) -> (usize, usize) {
     let m = w.max(h).max(1) as f64;
-    let s = (1280.0 / m).min(1.0);
+    let s = (max_side.max(1) as f64 / m).min(1.0);
     (((w as f64 * s).round() as usize).max(1), ((h as f64 * s).round() as usize).max(1))
 }
 
-/// One RGBA frame at time `t`, scaled for preview. FFmpeg auto-rotates, so it matches `VideoInfo` size.
-pub fn grab_frame(bins: &Bins, path: &Path, t: f64, w: u32, h: u32) -> Res<(usize, usize, Vec<u8>)> {
-    let (pw, ph) = preview_size(w, h);
+/// One RGBA frame at time `t`, already scaled to `pw` x `ph`. FFmpeg
+/// auto-rotates, so it matches `VideoInfo` size.
+pub fn grab_frame(bins: &Bins, path: &Path, t: f64, pw: usize, ph: usize) -> Res<(usize, usize, Vec<u8>)> {
     let out = command(&bins.ffmpeg)
         .args(["-v", "error", "-ss"])
         .arg(fmt_secs(t))
@@ -235,9 +242,18 @@ impl Player {
         w: u32,
         h: u32,
         fps: f64,
+        crop: Option<(u32, u32, u32, u32)>,
         on_frame: Arc<dyn Fn() + Send + Sync>,
     ) -> Res<Self> {
-        let (pw, ph) = preview_size(w, h);
+        // A crop is cut out by the decoder itself, so what arrives is the
+        // selection at its own resolution rather than a small piece of the
+        // whole frame blown up to fill the window.
+        let (cw, ch) = crop.map(|(w, h, _, _)| (w, h)).unwrap_or((w, h));
+        let (pw, ph) = preview_size(cw, ch);
+        let vf = match crop {
+            Some((cw, ch, cx, cy)) => format!("crop={cw}:{ch}:{cx}:{cy},scale={pw}:{ph}"),
+            None => format!("scale={pw}:{ph}"),
+        };
         // Deliberately no -re. It paces against the moment ffmpeg started, so a
         // slow seek - which has to decode forward from the keyframe before the
         // start point - leaves the first second of the clip overdue, and ffmpeg
@@ -256,7 +272,7 @@ impl Player {
             .args(["-t"])
             .arg(fmt_secs((until - from).max(0.05)))
             .args(["-an", "-sn", "-vf"])
-            .arg(format!("scale={pw}:{ph}"))
+            .arg(vf)
             .args(["-pix_fmt", "rgba", "-f", "rawvideo", "-"])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -818,7 +834,8 @@ mod tests {
         assert!((info.duration - 12.0).abs() < 0.2, "{}", info.duration);
         assert_eq!(info.v_codec, "h264");
         assert_eq!(info.a_codec.as_deref(), Some("aac"));
-        let (w, h, data) = grab_frame(&b, &src, 3.0, info.width, info.height).unwrap();
+        let (pw, ph) = preview_size(info.width, info.height);
+        let (w, h, data) = grab_frame(&b, &src, 3.0, pw, ph).unwrap();
         assert_eq!((w, h), (640, 360));
         assert_eq!(data.len(), 640 * 360 * 4);
         assert!(data.iter().any(|&x| x != 0));
@@ -832,7 +849,7 @@ mod tests {
     fn playback_starts_at_the_video_rate() {
         let b = bins();
         let src = make_video(); // 30 fps
-        let mut p = Player::start(&b, &src, 0.0, 6.0, 640, 360, 30.0, Arc::new(|| {})).unwrap();
+        let mut p = Player::start(&b, &src, 0.0, 6.0, 640, 360, 30.0, None, Arc::new(|| {})).unwrap();
 
         let n = 30; // one second of video
         let start = std::time::Instant::now();
@@ -858,7 +875,7 @@ mod tests {
     fn player_delivers_frames() {
         let b = bins();
         let src = make_video();
-        let mut p = Player::start(&b, &src, 2.0, 4.0, 640, 360, 30.0, Arc::new(|| {})).unwrap();
+        let mut p = Player::start(&b, &src, 2.0, 4.0, 640, 360, 30.0, None, Arc::new(|| {})).unwrap();
 
         let wait = std::time::Duration::from_secs(15);
         let mut first = None;
@@ -885,6 +902,30 @@ mod tests {
         }
         assert!(second, "playback stopped after a single frame");
         p.stop();
+    }
+
+    /// Playing a cropped clip has to show the crop and nothing else, at the
+    /// crop's own size rather than a window onto the whole frame.
+    #[test]
+    fn player_shows_only_the_crop() {
+        let b = bins();
+        let src = make_video();
+        let crop = Some((320, 180, 100u32, 50u32));
+        let mut p = Player::start(&b, &src, 1.0, 2.0, 640, 360, 30.0, crop, Arc::new(|| {})).unwrap();
+
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let mut first = None;
+        while first.is_none() && std::time::Instant::now() < end {
+            if let Some(f) = p.take_frame() {
+                first = Some(f);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let (w, h, data) = first.expect("no frame arrived from the cropped player");
+        p.stop();
+        assert_eq!((w, h), (320, 180), "the player did not cut out the crop");
+        assert_eq!(data.len(), w * h * 4);
+        assert!(data.iter().any(|&x| x != 0), "the cropped frame is entirely black");
     }
 
     #[test]

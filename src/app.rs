@@ -2,7 +2,7 @@ use crate::crop::{self, Aspect, CropRect, Handle};
 use crate::ffmpeg::{self, Bins, Job, Mode, VideoInfo};
 use crate::timeline;
 use crate::version_line;
-use eframe::egui::{self, pos2, vec2, Color32, CursorIcon, Rect, RichText, Sense, Stroke};
+use eframe::egui::{self, pos2, vec2, Color32, CursorIcon, Pos2, Rect, RichText, Sense, Stroke, Vec2};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -119,6 +119,16 @@ struct Plan {
     gif: Option<ffmpeg::GifOpts>,
 }
 
+/// A crop-box drag in progress. The box is recomputed from the one it started
+/// with every frame, so a slow drag is never rounded away by the snapping and
+/// nothing accumulates while the pointer is held down.
+#[derive(Clone, Copy)]
+struct Drag {
+    handle: Handle,
+    origin: Pos2,
+    rect: CropRect,
+}
+
 pub struct App {
     tx: Sender<Msg>,
     rx: Receiver<Msg>,
@@ -135,7 +145,14 @@ pub struct App {
     keyframes: Vec<f64>,
     crop: CropRect,
     aspect: Aspect,
-    drag: Option<Handle>,
+    drag: Option<Drag>,
+    /// Preview view: 1.0 is the picture fitted to the window, and the wheel
+    /// scales it from there; `pan` shifts a zoomed picture.
+    zoom: f32,
+    pan: Vec2,
+    /// Preview only, never the saved file: nearest-neighbour sampling, and the
+    /// crop edges land on whole pixels.
+    disable_smoothing: bool,
     pos: f64,
     start: f64,
     end: f64,
@@ -210,6 +227,9 @@ impl App {
             crop: CropRect::full(1.0, 1.0),
             aspect: Aspect::Free,
             drag: None,
+            zoom: 1.0,
+            pan: Vec2::ZERO,
+            disable_smoothing: false,
             pos: 0.0,
             start: 0.0,
             end: 0.0,
@@ -248,6 +268,28 @@ impl App {
         }
     }
 
+    /// Sampling for preview textures. Without smoothing the picture is drawn
+    /// as nearest pixel, so a zoom shows the pixels the file actually has
+    /// instead of a blurred guess at them. Saved files are never affected.
+    fn tex_options(&self) -> egui::TextureOptions {
+        if self.disable_smoothing {
+            egui::TextureOptions::NEAREST
+        } else {
+            egui::TextureOptions::LINEAR
+        }
+    }
+
+    /// How large a still preview should be grabbed. Zoomed in, it is grabbed
+    /// above 1280 so that a video pixel is not softer than the screen pixel it
+    /// lands on - that is what makes a crop to one pixel possible. The step
+    /// doubles, so a turn of the wheel does not re-grab at a new size for
+    /// every notch; it never goes past the picture's own size.
+    fn still_size(&self, info: &VideoInfo) -> (usize, usize) {
+        let level = if self.zoom > 1.0 { 2f32.powf(self.zoom.log2().floor()).max(1.0) } else { 1.0 };
+        let long = (1280.0 * level).round() as u32;
+        ffmpeg::fit_size(info.width, info.height, long.min(info.width.max(info.height).max(1)))
+    }
+
     // ---------------------------------------------------------------- loading
 
     fn open(&mut self, ctx: &egui::Context, path: PathBuf) {
@@ -260,6 +302,8 @@ impl App {
         self.keyframes.clear();
         self.pending_t = None;
         self.drag = None;
+        self.zoom = 1.0;
+        self.pan = Vec2::ZERO;
         self.notice = None;
         let (tx, ctx2, gen) = (self.tx.clone(), ctx.clone(), self.gen);
         std::thread::spawn(move || {
@@ -285,6 +329,8 @@ impl App {
         self.keyframes.clear();
         self.pending_t = None;
         self.drag = None;
+        self.zoom = 1.0;
+        self.pan = Vec2::ZERO;
         self.notice = None;
         self.crop = CropRect::full(1.0, 1.0);
         self.aspect = Aspect::Free;
@@ -339,7 +385,8 @@ impl App {
                         match res {
                             Ok((w, h, data)) => {
                                 let img = egui::ColorImage::from_rgba_unmultiplied([w, h], &data);
-                                self.texture = Some(ctx.load_texture("frame", img, egui::TextureOptions::LINEAR));
+                                let opts = self.tex_options();
+                                self.texture = Some(ctx.load_texture("frame", img, opts));
                             }
                             Err(e) => self.notice = Some(Notice::Error(e)),
                         }
@@ -375,14 +422,15 @@ impl App {
             let (Some(t), Some(info)) = (self.pending_t, self.info.as_ref()) else {
                 return;
             };
-            (t, bins, info.path.clone(), info.width, info.height, info.duration)
+            let size = self.still_size(info);
+            (t, bins, info.path.clone(), size, info.duration)
         };
         self.pending_t = None;
         self.frame_in_flight = true;
-        let (t, bins, path, w, h, dur) = job;
+        let (t, bins, path, (pw, ph), dur) = job;
         let (tx, ctx2, gen) = (self.tx.clone(), ctx.clone(), self.gen);
         std::thread::spawn(move || {
-            let r = ffmpeg::grab_frame(&bins, &path, t.min(dur - 0.05).max(0.0), w, h);
+            let r = ffmpeg::grab_frame(&bins, &path, t.min(dur - 0.05).max(0.0), pw, ph);
             let _ = tx.send(Msg::Frame(gen, r));
             ctx2.request_repaint();
         });
@@ -429,9 +477,25 @@ impl App {
         self.play_frames = 0;
         self.pending_t = None;
 
+        // A crop changes what playback is: the decoder is told to cut out just
+        // that box, so the preview plays the selection instead of showing the
+        // whole frame with the rest of it going unnoticed.
+        let (fw, fh) = (info.width as f32, info.height as f32);
+        let crop_px = if self.crop.is_full(fw, fh) { None } else { Some(self.crop.to_pixels(info.width, info.height)) };
+
         let ctx2 = ctx.clone();
         let repaint: Arc<dyn Fn() + Send + Sync> = Arc::new(move || ctx2.request_repaint());
-        match ffmpeg::Player::start(&bins, &info.path, self.pos, self.end, info.width, info.height, info.fps, repaint) {
+        match ffmpeg::Player::start(
+            &bins,
+            &info.path,
+            self.pos,
+            self.end,
+            info.width,
+            info.height,
+            info.fps,
+            crop_px,
+            repaint,
+        ) {
             Ok(p) => {
                 self.player = Some(p);
                 self.notice = None;
@@ -442,8 +506,26 @@ impl App {
     }
 
     /// Dropping the player kills the decoder and joins its reader thread.
+    ///
+    /// The last picture it drew is the crop, so a still of the whole frame has
+    /// to be grabbed again before the preview goes back to showing one.
     fn stop_playback(&mut self) {
-        self.player = None;
+        let was = self.player.take();
+        if was.is_some() && self.info.is_some() {
+            self.pending_t = Some(self.pos);
+        }
+    }
+
+    /// Move the playhead by whole frames. Stepping stops playback: a frame
+    /// cannot be looked at while the video is running past it.
+    fn step_frame(&mut self, delta: i64) {
+        let Some(info) = self.info.as_ref() else { return };
+        let fps = if info.fps > 0.5 { info.fps } else { 30.0 };
+        let last = (info.duration * fps).floor() as i64;
+        let frame = ((self.pos * fps).round() as i64 + delta).clamp(0, last.max(0));
+        self.stop_playback();
+        self.pos = frame as f64 / fps;
+        self.pending_t = Some(self.pos);
     }
 
     fn pump_playback(&mut self, ctx: &egui::Context) {
@@ -451,10 +533,11 @@ impl App {
 
         if let Some((w, h, data)) = player.take_frame() {
             let img = egui::ColorImage::from_rgba_unmultiplied([w, h], &data);
+            let opts = self.tex_options();
             match &mut self.texture {
-                Some(tex) if tex.size() == [w, h] => tex.set(img, egui::TextureOptions::LINEAR),
+                Some(tex) if tex.size() == [w, h] => tex.set(img, opts),
                 _ => {
-                    self.texture = Some(ctx.load_texture("frame", img, egui::TextureOptions::LINEAR));
+                    self.texture = Some(ctx.load_texture("frame", img, opts));
                 }
             }
         }
@@ -720,8 +803,75 @@ impl App {
         let area = ui.available_rect_before_wrap();
         ui.allocate_rect(area, Sense::hover());
         let avail = area.shrink(8.0);
-        let scale = (avail.width() / fw).min(avail.height() / fh).max(0.01);
-        let disp = Rect::from_center_size(avail.center(), vec2(fw * scale, fh * scale));
+        let busy = self.export.is_some();
+        let playing = self.is_playing();
+        let cropped = !self.crop.is_full(fw, fh);
+
+        // While a cropped clip plays, the decoder hands over just the crop, so
+        // the preview *is* the selection - the picture the file will hold, and
+        // nothing around it. Paused, the whole frame is shown, fitted to the
+        // window and then zoomed by the wheel.
+        let (cw, ch) = if playing && cropped {
+            (self.crop.w().max(1.0), self.crop.h().max(1.0))
+        } else {
+            (fw, fh)
+        };
+        let fit = (avail.width() / cw).min(avail.height() / ch).max(0.01);
+        let view = |zoom: f32, pan: Vec2| {
+            let scale = fit * zoom;
+            (scale, Rect::from_center_size(avail.center() + pan, vec2(cw * scale, ch * scale)))
+        };
+        let (mut scale, mut disp) =
+            view(if playing { 1.0 } else { self.zoom }, if playing { Vec2::ZERO } else { self.pan });
+
+        // The picture only answers the pointer where the panel can show it: a
+        // zoomed one is larger than the panel, and must not take clicks from
+        // the bar below.
+        let resp = ui.interact(disp.expand(6.0).intersect(area), ui.id().with("crop_area"), Sense::click_and_drag());
+
+        if !playing {
+            // The wheel zooms around the pointer, so the pixel under it stays
+            // under it while the picture grows and shrinks.
+            let zoom_before = self.zoom;
+            if resp.hovered() {
+                let scroll = ui.input(|i| i.raw_scroll_delta.y);
+                if scroll != 0.0 {
+                    self.zoom = (self.zoom * (scroll * 0.0025).exp()).clamp(1.0, 8.0);
+                    if let Some(p) = resp.hover_pos() {
+                        let anchor = (p - disp.min) / scale.max(0.01);
+                        let ns = fit * self.zoom;
+                        self.pan = p - anchor * ns + vec2(cw, ch) * ns / 2.0 - avail.center();
+                    }
+                }
+            }
+            // Middle-drag pans, the way an image viewer does.
+            let (middle, delta, pointer) = ui.input(|i| {
+                (i.pointer.button_down(egui::PointerButton::Middle), i.pointer.delta(), i.pointer.interact_pos())
+            });
+            if middle && pointer.is_some_and(|p| area.contains(p)) && self.zoom > 1.0 {
+                self.pan += delta;
+            }
+            // Keep the picture over the window: it cannot be dragged off into
+            // the dark, and a fitted one cannot move at all.
+            let (_, fitted) = view(self.zoom, self.pan);
+            let room = (fitted.size() - avail.size()) / 2.0;
+            self.pan = vec2(
+                self.pan.x.clamp(-room.x.max(0.0), room.x.max(0.0)),
+                self.pan.y.clamp(-room.y.max(0.0), room.y.max(0.0)),
+            );
+            let (s2, d2) = view(self.zoom, self.pan);
+            scale = s2;
+            disp = d2;
+
+            // A zoomed picture is grabbed larger, so one video pixel keeps a
+            // pixel of its own on screen.
+            if self.zoom != zoom_before && !self.frame_in_flight && self.pending_t.is_none() {
+                let size = self.still_size(&info);
+                if self.texture.as_ref().map(|t| t.size()) != Some([size.0, size.1]) {
+                    self.pending_t = Some(self.pos);
+                }
+            }
+        }
         self.disp = disp;
         self.scale = scale;
 
@@ -750,9 +900,6 @@ impl App {
             x1: disp.left() + c.x1 * scale,
             y1: disp.top() + c.y1 * scale,
         };
-        let busy = self.export.is_some();
-        let playing = self.is_playing();
-        let resp = ui.interact(disp.expand(12.0), ui.id().with("crop_area"), Sense::click_and_drag());
         // A click on the picture pauses, the way a player behaves.
         if playing && resp.clicked() {
             self.stop_playback();
@@ -762,18 +909,27 @@ impl App {
             let hover = resp.hover_pos().and_then(|p| crop::hit_test(&sr, p.x, p.y, 10.0));
             if resp.drag_started() {
                 let origin = ui.input(|i| i.pointer.press_origin());
-                self.drag = origin.and_then(|p| crop::hit_test(&sr, p.x, p.y, 10.0));
+                let rect = self.crop;
+                self.drag = origin
+                    .and_then(|p| crop::hit_test(&sr, p.x, p.y, 10.0).map(|handle| Drag { handle, origin: p, rect }));
             }
             if resp.dragged() {
-                if let Some(h) = self.drag {
-                    let d = resp.drag_delta() / scale;
-                    crop::apply_drag(&mut self.crop, h, d.x, d.y, fw, fh, 16.0, self.aspect.ratio());
+                if let (Some(d), Some(p)) = (self.drag, resp.interact_pointer_pos()) {
+                    // Every frame starts from the box the drag began with, so
+                    // a slow drag is never rounded away by the snapping.
+                    let mut r = d.rect;
+                    let delta = (p - d.origin) / scale.max(0.01);
+                    crop::apply_drag(&mut r, d.handle, delta.x, delta.y, fw, fh, 16.0, self.aspect.ratio());
+                    if self.disable_smoothing {
+                        crop::snap(&mut r, fw, fh);
+                    }
+                    self.crop = r;
                 }
             }
             if resp.drag_stopped() {
                 self.drag = None;
             }
-            if let Some(h) = self.drag.or(hover) {
+            if let Some(h) = self.drag.map(|d| d.handle).or(hover) {
                 ctx.set_cursor_icon(match h {
                     Handle::Move => CursorIcon::Move,
                     Handle::N | Handle::S => CursorIcon::ResizeVertical,
@@ -875,6 +1031,23 @@ impl App {
                     self.start = 0.0;
                     self.end = info.duration;
                 }
+                // A preview setting, not an output one, so it sits next to the
+                // other trims rather than with the format choices.
+                if ui
+                    .checkbox(&mut self.disable_smoothing, "Disable video smoothing")
+                    .on_hover_text(
+                        "Preview only: draws whole pixels instead of a smoothed picture, and makes \
+                         the crop edges land on whole pixels. The saved file is not affected.\n\
+                         Scroll over the picture to zoom; middle-drag pans a zoomed one.",
+                    )
+                    .changed()
+                    && !self.is_playing()
+                    && self.info.is_some()
+                {
+                    // The sampling is fixed when the texture is uploaded, so
+                    // the frame has to be grabbed again to change it.
+                    self.pending_t = Some(self.pos);
+                }
             });
 
             ui.add_space(4.0);
@@ -886,6 +1059,9 @@ impl App {
                         self.aspect = a;
                         if let Some(ra) = a.ratio() {
                             self.crop = crop::fit_aspect(fw, fh, ra);
+                            if self.disable_smoothing {
+                                crop::snap(&mut self.crop, fw, fh);
+                            }
                         }
                     }
                 }
@@ -1072,6 +1248,23 @@ impl App {
             self.toggle_play(ctx);
         }
 
+        // Left and right step one frame at a time, which is the only way to
+        // land on an exact frame by hand.
+        if self.info.is_some() && self.export.is_none() {
+            let (back, forward) = ctx.input_mut(|i| {
+                (
+                    i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft),
+                    i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight),
+                )
+            });
+            if back {
+                self.step_frame(-1);
+            }
+            if forward {
+                self.step_frame(1);
+            }
+        }
+
         // Dropped files.
         let dropped = ctx.input(|i| i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).next());
         if let Some(p) = dropped {
@@ -1197,6 +1390,152 @@ mod tests {
         assert_eq!(app.pos, 0.0, "the playhead should sit at the start, not ten percent in");
         assert_eq!(app.start, 0.0);
         assert!(app.end > 1.0);
+    }
+
+    #[test]
+    fn arrow_keys_step_exactly_one_frame() {
+        let ctx = egui::Context::default();
+        let mut app = App::with_ctx(&ctx);
+        let mut t = 0.0;
+        step(&mut app, &ctx, &mut t, vec![]);
+        wait_until(&mut app, &ctx, &mut t, "ffmpeg", |a| a.bins().is_some());
+
+        app.open(&ctx, make_src());
+        wait_until(&mut app, &ctx, &mut t, "preview", |a| a.info.is_some() && a.texture.is_some());
+        let fps = app.info.as_ref().unwrap().fps;
+        assert!((fps - 30.0).abs() < 0.01, "fps {fps}");
+        assert_eq!(app.pos, 0.0);
+
+        let key = |k| Event::Key {
+            key: k,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        };
+        step(&mut app, &ctx, &mut t, vec![key(egui::Key::ArrowRight)]);
+        assert!((app.pos - 1.0 / 30.0).abs() < 1e-9, "pos {}", app.pos);
+        step(&mut app, &ctx, &mut t, vec![key(egui::Key::ArrowRight)]);
+        assert!((app.pos - 2.0 / 30.0).abs() < 1e-9, "pos {}", app.pos);
+        step(&mut app, &ctx, &mut t, vec![key(egui::Key::ArrowLeft)]);
+        assert!((app.pos - 1.0 / 30.0).abs() < 1e-9, "pos {}", app.pos);
+
+        // It cannot step back past the first frame.
+        for _ in 0..4 {
+            step(&mut app, &ctx, &mut t, vec![key(egui::Key::ArrowLeft)]);
+        }
+        assert_eq!(app.pos, 0.0);
+    }
+
+    #[test]
+    fn the_wheel_zooms_the_preview() {
+        let ctx = egui::Context::default();
+        let mut app = App::with_ctx(&ctx);
+        let mut t = 0.0;
+        step(&mut app, &ctx, &mut t, vec![]);
+        wait_until(&mut app, &ctx, &mut t, "ffmpeg", |a| a.bins().is_some());
+
+        app.open(&ctx, make_src());
+        wait_until(&mut app, &ctx, &mut t, "preview", |a| a.info.is_some() && a.texture.is_some());
+        assert_eq!(app.zoom, 1.0);
+
+        let wheel = |dy: f32| Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: vec2(0.0, dy),
+            modifiers: Modifiers::NONE,
+        };
+        // The pointer has to be over the picture: the wheel is only a zoom there.
+        let centre = app.disp.center();
+        step(&mut app, &ctx, &mut t, vec![Event::PointerMoved(centre)]);
+        step(&mut app, &ctx, &mut t, vec![wheel(60.0)]);
+        assert!(app.zoom > 1.0, "the wheel did not zoom: {}", app.zoom);
+        let zoomed = app.zoom;
+
+        // Zooming out stops at the fitted picture, with nothing panned away.
+        for _ in 0..40 {
+            step(&mut app, &ctx, &mut t, vec![wheel(-60.0)]);
+        }
+        assert_eq!(app.zoom, 1.0, "zoom {}", app.zoom);
+        assert_eq!(app.pan, Vec2::ZERO, "a fitted picture cannot be off centre");
+        assert!(zoomed > 1.1);
+    }
+
+    /// The player is told to cut out the crop, so the picture on screen while
+    /// a cropped clip plays is the selection and nothing else.
+    #[test]
+    fn playing_a_cropped_clip_shows_only_the_crop() {
+        let ctx = egui::Context::default();
+        let mut app = App::with_ctx(&ctx);
+        let mut t = 0.0;
+        step(&mut app, &ctx, &mut t, vec![]);
+        wait_until(&mut app, &ctx, &mut t, "ffmpeg", |a| a.bins().is_some());
+
+        app.open(&ctx, make_src());
+        wait_until(&mut app, &ctx, &mut t, "preview", |a| a.info.is_some() && a.texture.is_some());
+
+        app.crop = CropRect { x0: 100.0, y0: 50.0, x1: 420.0, y1: 230.0 };
+        app.end = 6.0;
+        app.pos = 0.0;
+        app.start_playback(&ctx);
+        wait_until(&mut app, &ctx, &mut t, "cropped playback", |a| {
+            a.texture.as_ref().is_some_and(|t| t.size() == [320, 180])
+        });
+
+        // Pausing goes back to a still of the whole frame.
+        app.stop_playback();
+        wait_until(&mut app, &ctx, &mut t, "the whole frame again", |a| {
+            a.texture.as_ref().is_some_and(|t| t.size() == [640, 360])
+        });
+    }
+
+    /// Drags the bottom-right crop handle by a screen-space offset.
+    fn drag_se(app: &mut App, ctx: &egui::Context, t: &mut f64, by: Vec2) {
+        let m = Modifiers::default();
+        let corner = pos2(app.disp.left() + app.crop.x1 * app.scale - 1.0, app.disp.top() + app.crop.y1 * app.scale - 1.0);
+        step(app, ctx, t, vec![Event::PointerMoved(corner)]);
+        step(
+            app,
+            ctx,
+            t,
+            vec![Event::PointerButton { pos: corner, button: PointerButton::Primary, pressed: true, modifiers: m }],
+        );
+        step(app, ctx, t, vec![Event::PointerMoved(corner + by)]);
+        step(
+            app,
+            ctx,
+            t,
+            vec![Event::PointerButton { pos: corner + by, button: PointerButton::Primary, pressed: false, modifiers: m }],
+        );
+        step(app, ctx, t, vec![]);
+    }
+
+    #[test]
+    fn without_smoothing_the_crop_snaps_to_whole_pixels() {
+        let ctx = egui::Context::default();
+        let mut app = App::with_ctx(&ctx);
+        let mut t = 0.0;
+        step(&mut app, &ctx, &mut t, vec![]);
+        wait_until(&mut app, &ctx, &mut t, "ffmpeg", |a| a.bins().is_some());
+
+        app.open(&ctx, make_src());
+        wait_until(&mut app, &ctx, &mut t, "preview", |a| a.info.is_some() && a.texture.is_some());
+
+        app.disable_smoothing = true;
+        drag_se(&mut app, &ctx, &mut t, vec2(-97.3, -61.7));
+        assert_eq!(app.crop.x1, app.crop.x1.round(), "x1 {}", app.crop.x1);
+        assert_eq!(app.crop.y1, app.crop.y1.round(), "y1 {}", app.crop.y1);
+        assert_eq!(app.crop.x0, 0.0);
+        assert!(app.crop.x1 < 600.0 && app.crop.x1 > 300.0, "x1 {}", app.crop.x1);
+
+        // With smoothing kept on the box is continuous, not snapped.
+        app.crop = CropRect::full(640.0, 360.0);
+        app.disable_smoothing = false;
+        drag_se(&mut app, &ctx, &mut t, vec2(-97.3, -61.7));
+        assert!(
+            app.crop.x1.fract() != 0.0 || app.crop.y1.fract() != 0.0,
+            "a smoothed preview should not snap: {:?}",
+            app.crop
+        );
     }
 
     #[test]
