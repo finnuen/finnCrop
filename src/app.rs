@@ -229,7 +229,9 @@ impl App {
             drag: None,
             zoom: 1.0,
             pan: Vec2::ZERO,
-            disable_smoothing: false,
+            // Whole pixels by default: a crop is easier to place on the grid
+            // the picture actually has, and the edges then land on it too.
+            disable_smoothing: true,
             pos: 0.0,
             start: 0.0,
             end: 0.0,
@@ -829,6 +831,10 @@ impl App {
         // the bar below.
         let resp = ui.interact(disp.expand(6.0).intersect(area), ui.id().with("crop_area"), Sense::click_and_drag());
 
+        // The middle button belongs to the picture, not to the box: it pans and
+        // nothing else, even when it is pressed on a handle.
+        let middle_held = ui.input(|i| i.pointer.button_down(egui::PointerButton::Middle));
+
         if !playing {
             // The wheel zooms around the pointer, so the pixel under it stays
             // under it while the picture grows and shrinks.
@@ -845,10 +851,8 @@ impl App {
                 }
             }
             // Middle-drag pans, the way an image viewer does.
-            let (middle, delta, pointer) = ui.input(|i| {
-                (i.pointer.button_down(egui::PointerButton::Middle), i.pointer.delta(), i.pointer.interact_pos())
-            });
-            if middle && pointer.is_some_and(|p| area.contains(p)) && self.zoom > 1.0 {
+            let (delta, pointer) = ui.input(|i| (i.pointer.delta(), i.pointer.interact_pos()));
+            if middle_held && pointer.is_some_and(|p| area.contains(p)) && self.zoom > 1.0 {
                 self.pan += delta;
             }
             // Keep the picture over the window: it cannot be dragged off into
@@ -907,13 +911,17 @@ impl App {
         if !busy && !playing {
             let sr = to_screen(&self.crop);
             let hover = resp.hover_pos().and_then(|p| crop::hit_test(&sr, p.x, p.y, 10.0));
-            if resp.drag_started() {
+            // Only the primary button drags the box. egui reports a drag for
+            // every button, so without this a middle-drag would move the box
+            // while it panned the picture under it.
+            let primary = egui::PointerButton::Primary;
+            if resp.drag_started_by(primary) {
                 let origin = ui.input(|i| i.pointer.press_origin());
                 let rect = self.crop;
                 self.drag = origin
                     .and_then(|p| crop::hit_test(&sr, p.x, p.y, 10.0).map(|handle| Drag { handle, origin: p, rect }));
             }
-            if resp.dragged() {
+            if resp.dragged_by(primary) {
                 if let (Some(d), Some(p)) = (self.drag, resp.interact_pointer_pos()) {
                     // Every frame starts from the box the drag began with, so
                     // a slow drag is never rounded away by the snapping.
@@ -929,7 +937,7 @@ impl App {
             if resp.drag_stopped() {
                 self.drag = None;
             }
-            if let Some(h) = self.drag.map(|d| d.handle).or(hover) {
+            if let Some(h) = self.drag.map(|d| d.handle).or(hover).filter(|_| !middle_held) {
                 ctx.set_cursor_icon(match h {
                     Handle::Move => CursorIcon::Move,
                     Handle::N | Handle::S => CursorIcon::ResizeVertical,
@@ -937,6 +945,8 @@ impl App {
                     Handle::NE | Handle::SW => CursorIcon::ResizeNeSw,
                     Handle::NW | Handle::SE => CursorIcon::ResizeNwSe,
                 });
+            } else if middle_held && self.zoom > 1.0 {
+                ctx.set_cursor_icon(CursorIcon::Grabbing);
             }
         }
 
@@ -1458,6 +1468,52 @@ mod tests {
         assert_eq!(app.zoom, 1.0, "zoom {}", app.zoom);
         assert_eq!(app.pan, Vec2::ZERO, "a fitted picture cannot be off centre");
         assert!(zoomed > 1.1);
+    }
+
+    /// egui reports a drag for every button, so a middle-drag over the box used
+    /// to move the box while it panned. The middle button is the picture's.
+    #[test]
+    fn a_middle_drag_pans_without_moving_the_box() {
+        let ctx = egui::Context::default();
+        let mut app = App::with_ctx(&ctx);
+        let mut t = 0.0;
+        step(&mut app, &ctx, &mut t, vec![]);
+        wait_until(&mut app, &ctx, &mut t, "ffmpeg", |a| a.bins().is_some());
+
+        app.open(&ctx, make_src());
+        wait_until(&mut app, &ctx, &mut t, "preview", |a| a.info.is_some() && a.texture.is_some());
+
+        app.zoom = 2.0;
+        step(&mut app, &ctx, &mut t, vec![]);
+        let before = app.crop;
+        let m = Modifiers::NONE;
+        let start = app.disp.center();
+        let end = start + vec2(30.0, 20.0);
+        step(&mut app, &ctx, &mut t, vec![Event::PointerMoved(start)]);
+        step(
+            &mut app,
+            &ctx,
+            &mut t,
+            vec![Event::PointerButton { pos: start, button: PointerButton::Middle, pressed: true, modifiers: m }],
+        );
+        step(&mut app, &ctx, &mut t, vec![Event::PointerMoved(end)]);
+        step(
+            &mut app,
+            &ctx,
+            &mut t,
+            vec![Event::PointerButton { pos: end, button: PointerButton::Middle, pressed: false, modifiers: m }],
+        );
+
+        assert_eq!(app.crop, before, "the middle button moved the crop box");
+        assert!(app.pan.x > 0.0 && app.pan.y > 0.0, "the picture did not pan: {:?}", app.pan);
+    }
+
+    /// Whole pixels to start with: the picture is drawn as it is, and the crop
+    /// edges land on the grid.
+    #[test]
+    fn the_pixelated_preview_is_the_default() {
+        let ctx = egui::Context::default();
+        assert!(App::with_ctx(&ctx).disable_smoothing);
     }
 
     /// The player is told to cut out the crop, so the picture on screen while
