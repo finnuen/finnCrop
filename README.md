@@ -78,6 +78,9 @@ The mode is picked for you and shown under the controls:
   whatever the file. That costs a re-encode of the picture: a lossless copy
   cannot start anywhere except on a keyframe, and keyframes can be seconds
   apart, which would make the clip longer than the range you selected.
+- **The preview settings are preview only.** Zooming, panning, the whole-pixel
+  drawing and the snapped crop edges change nothing in the file: the box decides
+  what is written, and the picture is encoded from the source at full resolution.
 - **GIF quality moves three things at once** — frame rate (15 / 12 / 10 fps),
   long side (800 / 640 / 480 px) and palette (256 / 192 / 128 colours). The
   picture is only ever made smaller, never bigger. A GIF is encoded in two
