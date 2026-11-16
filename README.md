@@ -6,7 +6,7 @@
 
 **Crop a region of a video and cut it - exactly where you asked.**
 
-![version](https://img.shields.io/badge/version-1.12-blue)
+![version](https://img.shields.io/badge/version-1.13-blue)
 ![licence](https://img.shields.io/badge/licence-Apache--2.0-blue)
 ![platform](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-lightgrey)
 ![download](https://img.shields.io/badge/download-204%20MB-lightgrey)
@@ -26,7 +26,7 @@ with x264 and the audio is copied untouched wherever the container allows it,
 so only what has to change does.
 
 It is also one file. FFmpeg and ffprobe travel inside the exe and are unpacked
-once to `%LOCALAPPDATA%\finnCrop\ffmpeg\1.12\`, so there is no installer, no
+once to `%LOCALAPPDATA%\finnCrop\ffmpeg\1.13\`, so there is no installer, no
 admin rights, and no DLL sitting beside it.
 
 ## Download
@@ -59,10 +59,11 @@ harmless — it is written again on the next start.
    with sound. With a crop set it plays the crop and nothing else, so what is on
    screen is what will be in the file. It pauses with *Pause*, <kbd>Space</kbd>, or
    a click on the picture, and moving the playhead stops it. *Sound*, beside the
-   button, silences the preview without touching what is saved, and the slider
-   right of it sets how loud the preview is, from silence to twice the source's
-   own level. <kbd>↑</kbd> and <kbd>↓</kbd> move that volume in 5% steps, and
-   holding one keeps stepping as the keyboard repeats.
+   button, silences the preview without touching what is saved, and it is
+   remembered for the next run. The box right of it sets how loud the preview
+   plays, from silence to twice the source's own level: drag it, or click and
+   type a number. <kbd>↑</kbd> and <kbd>↓</kbd> move that volume in 5% steps,
+   and holding one keeps stepping as the keyboard repeats.
 5. **Save…** — the original file is never overwritten.
 
 ## Modes
@@ -88,10 +89,12 @@ The mode is picked for you and shown under the controls:
 - **Playback has sound.** The soundtrack is decoded separately from the picture
   and handed to the default output device; a machine whose sound will not open
   still plays the picture, and a video with no audio track dims *Sound*. The
-  switch silences the preview only — nothing about playback is saved.
-- **The volume slider is the sound's loudness.** Beside *Sound*, it runs from
-  silence to twice the source's own level (0–200%), and the box at its end can
-  be typed into when whole steps are not enough. *Apply current volume level to
+  switch silences the preview only — nothing about playback is saved — and its
+  position is remembered in `%LOCALAPPDATA%\finnCrop\settings.txt` for the next
+  run.
+- **The volume box is the sound's loudness.** Beside *Sound*, it runs from
+  silence to twice the source's own level (0–200%). Drag it for slow, whole-odd
+  steps, or click it and type the number outright. *Apply current volume level to
   output* in the format row uses the same number for the saved file instead of
   only for the preview. Turning the sound up or down means re-encoding it — a
   copied stream cannot be filtered — so the audio is written again as AAC while
@@ -142,7 +145,7 @@ embeds.
 Rust with the `x86_64-pc-windows-gnu` toolchain:
 
 ```powershell
-.\build.ps1                 # release build, version bumped (1.12 -> 1.13)
+.\build.ps1                 # release build, version bumped (1.13 -> 1.14)
 .\build.ps1 -Debug          # debug build, fast, ffmpeg read from vendor\
 .\build.ps1 -KeepVersion    # rebuild the same version
 .\build.ps1 -Version 2.0    # set the version outright
@@ -150,7 +153,7 @@ Rust with the `x86_64-pc-windows-gnu` toolchain:
 
 `Cargo.toml` holds the version and nothing else does; the script writes it into
 the build's name, the exe's version block, the title bar and the About window.
-The result is `dist\finnCrop_v1.12.exe`, about 205 MB with FFmpeg inside.
+The result is `dist\finnCrop_v1.13.exe`, about 205 MB with FFmpeg inside.
 
 The first build downloads FFmpeg once (about 110 MB), from the one pinned 9.0.2
 package, and packs it into the executable. The download is checked against a

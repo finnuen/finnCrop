@@ -38,7 +38,7 @@ const BUFFERS: usize = 4;
 /// thread can share it without a lock: 1000 is the source as it is, 2000 is
 /// twice as loud.
 const GAIN_ONE: u32 = 1000;
-/// 200%: the top of the slider. waveOutSetVolume cannot go past 100%, which is
+/// 200%: the top of the volume box. waveOutSetVolume cannot go past 100%, which is
 /// why the scaling happens to the samples before the card sees them.
 const GAIN_MAX: u32 = 2000;
 
@@ -177,7 +177,7 @@ fn read_upto(r: &mut impl Read, buf: &mut [u8]) -> usize {
     n
 }
 
-/// A gain as thousandths, clamped to what the slider offers.
+/// A gain as thousandths, clamped to what the volume box offers.
 fn to_milli(gain: f32) -> u32 {
     ((gain as f64 * GAIN_ONE as f64).round() as i64).clamp(0, GAIN_MAX as i64) as u32
 }
@@ -197,7 +197,7 @@ fn scaled(v: i16, milli: u32) -> i16 {
 }
 
 /// Scales a whole buffer, ramping from the level it last had to the one asked
-/// for, so a moving slider glides instead of stepping at buffer boundaries.
+/// for, so a moving box glides instead of stepping at buffer boundaries.
 /// Both channels of a frame always get the same gain. Returns the level the
 /// next buffer starts from.
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -461,7 +461,7 @@ fn sink(
         if n == 0 {
             break; // end of the trimmed range
         }
-        // Read the slider once per buffer: the ramp then covers the whole
+        // Read the volume once per buffer: the ramp then covers the whole
         // hand-over, and a fast drag makes one smooth step per 43 ms.
         let now = gain.load(Ordering::Relaxed);
         milli = apply_gain(&mut buf[..n], milli, now);
@@ -554,7 +554,7 @@ mod tests {
     /// The preview's volume is applied to the samples by hand: half is half,
     /// double is double, and a boosted sample that runs out of range clips at
     /// the top of the scale instead of wrapping round to noise. 100% must be
-    /// bit-exact, or a video with the slider left alone would be altered.
+    /// bit-exact, or a video with the volume left alone would be altered.
     #[test]
     fn the_gain_scales_samples_and_clips() {
         assert_eq!(scaled(1000, 500), 500);
@@ -565,13 +565,13 @@ mod tests {
         assert_eq!(scaled(1234, GAIN_ONE), 1234);
         assert_eq!(scaled(-1234, GAIN_ONE), -1234);
         assert_eq!(scaled(1234, 0), 0);
-        // Out-of-range requests are clamped to the slider's range, not obeyed.
+        // Out-of-range requests are clamped to the box's range, not obeyed.
         assert_eq!(to_milli(2.5), GAIN_MAX);
         assert_eq!(to_milli(-1.0), 0);
         assert_eq!(to_milli(1.0), GAIN_ONE);
     }
 
-    /// A moved slider ramps across the buffer rather than stepping: the first
+    /// A moved volume box ramps across the buffer rather than stepping: the first
     /// frame at the level it had, the last at the level asked for, and both
     /// channels of a frame together so the picture does not wander between
     /// the speakers.

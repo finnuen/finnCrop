@@ -1,6 +1,7 @@
 use crate::audio;
 use crate::crop::{self, Aspect, CropRect, Handle};
 use crate::ffmpeg::{self, Bins, Job, Mode, VideoInfo};
+use crate::settings;
 use crate::timeline;
 use crate::version_line;
 use eframe::egui::{self, pos2, vec2, Color32, CursorIcon, Pos2, Rect, RichText, Sense, Stroke, Vec2};
@@ -250,7 +251,11 @@ fn reveal(path: &Path) {
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        Self::with_ctx(&cc.egui_ctx)
+        let mut app = Self::with_ctx(&cc.egui_ctx);
+        // The one setting that is remembered from the last run. Tests build the
+        // window through `with_ctx`, so they never touch the real file.
+        app.sound_on = settings::Settings::load().sound_on;
+        app
     }
 
     fn with_ctx(ctx: &egui::Context) -> Self {
@@ -579,8 +584,8 @@ impl App {
         }
     }
 
-    /// The slider or the number box moved: pass it to the sound that is
-    /// playing, if one is. The next buffers are ramped, so nothing clicks.
+    /// The volume box moved: pass it to the sound that is playing, if one is.
+    /// The next buffers are ramped, so nothing clicks.
     fn volume_changed(&mut self) {
         if let Some(sound) = self.sound.as_ref() {
             sound.set_gain(self.volume / 100.0);
@@ -588,7 +593,7 @@ impl App {
     }
 
     /// Steps the volume by whole 5% increments, kept whole and inside the
-    /// slider's range. One call per key event, so holding an arrow key moves
+    /// box's range. One call per key event, so holding an arrow key moves
     /// at the speed the keyboard repeats at, with nothing added on top.
     fn nudge_volume(&mut self, steps: f32) {
         let v = (self.volume + steps * VOLUME_STEP).round().clamp(0.0, 200.0);
@@ -683,7 +688,7 @@ impl App {
         let audio = self.format.is_audio();
         // The sound is turned up or down only when the box asks for it, the
         // file has a sound to turn, and that sound is being kept at all. 100%
-        // is no change, so the box does nothing while the slider sits there.
+        // is no change, so the box does nothing while it sits at 100%.
         let volume = if self.apply_volume
             && !gif
             && info.a_codec.is_some()
@@ -1188,34 +1193,25 @@ impl App {
                 // The preview's own switch, not an output setting: what the
                 // saved file does with its sound is *Keep audio*, further along.
                 let has_sound = info.a_codec.is_some();
-                if ui
+                let sound = ui
                     .add_enabled(has_sound, egui::Checkbox::new(&mut self.sound_on, "Sound"))
-                    .on_hover_text("Plays the soundtrack with the preview.")
-                    .on_disabled_hover_text("This video has no audio track.")
-                    .changed()
-                    && self.is_playing()
-                {
-                    // Ticking it mid-play starts the sound at the frame on
-                    // screen; unticking it stops the sound there too.
-                    self.start_sound(self.pos, true);
+                    .on_hover_text("Plays the soundtrack with the preview. The switch is remembered.")
+                    .on_disabled_hover_text("This video has no audio track.");
+                if sound.changed() {
+                    // The one switch that says how the program should behave
+                    // before a file is open, so it outlives the session.
+                    settings::Settings { sound_on: self.sound_on }.save();
+                    if self.is_playing() {
+                        // Ticking it mid-play starts the sound at the frame on
+                        // screen; unticking it stops the sound there too.
+                        self.start_sound(self.pos, true);
+                    }
                 }
                 // The preview's loudness - and, with the box further along the
-                // format row ticked, the saved file's too. The slider keeps its
-                // own number hidden: the box beside it is the same value, and
-                // it can be typed into.
-                let loudness = ui
-                    .add_enabled(
-                        has_sound,
-                        egui::Slider::new(&mut self.volume, 0.0..=200.0)
-                            .suffix("%")
-                            .fixed_decimals(0)
-                            .show_value(false),
-                    )
-                    .on_hover_text(
-                        "Loudness of the preview. Tick *Apply current volume level to output* to use it \
-                         in the saved file as well.",
-                    )
-                    .on_disabled_hover_text("This video has no audio track.");
+                // format row ticked, the saved file's too. One control: a box
+                // that drags like a slider and can be clicked and typed into.
+                // It moves at half the usual drag speed, so an odd percentage
+                // is easy to land on.
                 let typed = ui
                     .add_enabled(
                         has_sound,
@@ -1223,10 +1219,21 @@ impl App {
                             .range(0.0..=200.0)
                             .suffix("%")
                             .max_decimals(0)
-                            .speed(1.0),
+                            .speed(0.5),
                     )
-                    .on_hover_text("The same volume as the slider: type it, or drag.");
-                if loudness.changed() || typed.changed() {
+                    .on_hover_text(
+                        "How loud the preview plays. Drag it, or click and type a number; tick \
+                         *Apply current volume level to output* to use it in the saved file too.",
+                    )
+                    .on_disabled_hover_text("This video has no audio track.");
+                if typed.changed() {
+                    self.volume_changed();
+                }
+                // The drag moves in halves, which is what makes an odd
+                // percentage easy to reach; the number snaps to whole once the
+                // mouse is let go, so what is saved is the 137% that is shown.
+                if typed.drag_stopped() || typed.lost_focus() {
+                    self.volume = self.volume.round();
                     self.volume_changed();
                 }
                 ui.separator();
@@ -1330,7 +1337,7 @@ impl App {
                 ui.add_enabled(!gif && !audio_only, egui::Checkbox::new(&mut self.keep_audio, "Keep audio"))
                     .on_hover_text("Off: the sound is dropped and the file is written without an audio track.")
                     .on_disabled_hover_text("A GIF has no sound, and an audio export is the sound itself.");
-                // The slider's volume, used for the saved file. Off by default:
+                // The box's volume, used for the saved file. Off by default:
                 // a save that only rewrites tags must not touch the sound.
                 let gain_possible = !gif && info.a_codec.is_some() && (audio_only || self.keep_audio);
                 ui.add_enabled(
@@ -1538,7 +1545,7 @@ impl App {
         }
 
         // Up and down move the volume in whole steps of 5% - the same number
-        // the slider and its box show. The keyboard's own repeat drives this:
+        // the box shows. The keyboard's own repeat drives this:
         // every repeat event is one step, so a held key runs at a steady speed
         // and never accelerates, and the ends of the range simply stop it.
         let has_sound = self.info.as_ref().is_some_and(|i| i.a_codec.is_some());
@@ -1802,7 +1809,7 @@ mod tests {
         step(&mut app, &ctx, &mut t, vec![key(down, false)]);
         assert_eq!(app.volume, 115.0);
 
-        // The ends of the slider stop it, and the number stays whole.
+        // The ends of the range stop it, and the number stays whole.
         for _ in 0..30 {
             step(&mut app, &ctx, &mut t, vec![key(up, true)]);
         }

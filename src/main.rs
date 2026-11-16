@@ -5,6 +5,7 @@ mod audio;
 mod bundled;
 mod crop;
 mod ffmpeg;
+mod settings;
 mod timeline;
 
 /// The program's name, spelled the one way it is spelled everywhere.
