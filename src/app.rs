@@ -13,6 +13,9 @@ const VIDEO_EXTS: &[&str] = &[
     "mp4", "m4v", "mov", "mkv", "webm", "avi", "wmv", "flv", "3gp", "mpg", "mpeg", "ts", "mts", "m2ts", "ogv", "gif",
 ];
 
+/// One press of the up or down arrow moves the volume this far, in percent.
+const VOLUME_STEP: f32 = 5.0;
+
 enum Msg {
     Bins(Result<Bins, String>),
     Probed(u64, Result<VideoInfo, String>),
@@ -138,6 +141,9 @@ struct Plan {
     eff_start: f64,
     dur: f64,
     crop_px: Option<(u32, u32, u32, u32)>,
+    /// Gain to apply to the sound, when the box under the controls asks for
+    /// one. `None` leaves the audio as it is copied or converted.
+    volume: Option<f64>,
     /// Geometry and frame rate, when the output is a GIF.
     gif: Option<ffmpeg::GifOpts>,
 }
@@ -191,6 +197,11 @@ pub struct App {
     sound: Option<audio::Sound>,
     /// The *Sound* switch, which only affects the preview.
     sound_on: bool,
+    /// The preview's loudness in percent, 0..=200. It is also the volume the
+    /// save applies when *Apply current volume level to output* is ticked.
+    volume: f32,
+    /// Whether the saved file takes that volume.
+    apply_volume: bool,
     /// Video time the current playback started at, and how many frames it has
     /// shown since: position follows the pictures, not the wall clock.
     play_from: f64,
@@ -206,6 +217,12 @@ fn fmt_time(t: f64) -> String {
     let ms = ((t - t.floor()) * 1000.0).round() as u64 % 1000;
     let s = t.floor() as u64;
     format!("{:02}:{:02}:{:02}.{:03}", s / 3600, (s / 60) % 60, s % 60, ms)
+}
+
+/// A gain as the whole percentage the controls show, for the sentences under
+/// them: `1.5` reads as `150%`.
+fn pct(gain: f64) -> String {
+    format!("{}%", (gain * 100.0).round() as i64)
 }
 
 fn pick_video() -> Option<PathBuf> {
@@ -271,6 +288,8 @@ impl App {
             player: None,
             sound: None,
             sound_on: true,
+            volume: 100.0,
+            apply_volume: false,
             play_from: 0.0,
             play_frames: 0,
             notice: None,
@@ -552,11 +571,30 @@ impl App {
         if info.a_codec.is_none() {
             return;
         }
-        self.sound = audio::Sound::start(&bins, &info.path, from, self.end).ok();
+        self.sound = audio::Sound::start(&bins, &info.path, from, self.end, self.volume / 100.0).ok();
         if now {
             if let Some(sound) = self.sound.as_ref() {
                 sound.begin();
             }
+        }
+    }
+
+    /// The slider or the number box moved: pass it to the sound that is
+    /// playing, if one is. The next buffers are ramped, so nothing clicks.
+    fn volume_changed(&mut self) {
+        if let Some(sound) = self.sound.as_ref() {
+            sound.set_gain(self.volume / 100.0);
+        }
+    }
+
+    /// Steps the volume by whole 5% increments, kept whole and inside the
+    /// slider's range. One call per key event, so holding an arrow key moves
+    /// at the speed the keyboard repeats at, with nothing added on top.
+    fn nudge_volume(&mut self, steps: f32) {
+        let v = (self.volume + steps * VOLUME_STEP).round().clamp(0.0, 200.0);
+        if v != self.volume {
+            self.volume = v;
+            self.volume_changed();
         }
     }
 
@@ -643,6 +681,19 @@ impl App {
         let trim_changed = self.start > 0.001 || self.end < info.duration - 0.001;
         let gif = self.format == OutFormat::Gif;
         let audio = self.format.is_audio();
+        // The sound is turned up or down only when the box asks for it, the
+        // file has a sound to turn, and that sound is being kept at all. 100%
+        // is no change, so the box does nothing while the slider sits there.
+        let volume = if self.apply_volume
+            && !gif
+            && info.a_codec.is_some()
+            && (audio || self.keep_audio)
+            && (self.volume - 100.0).abs() >= 0.5
+        {
+            Some((self.volume / 100.0) as f64)
+        } else {
+            None
+        };
         // Cutting re-encodes the picture. A stream copy can only begin on a
         // keyframe, so it cannot start where the trim says unless the trim
         // happens to land on one - and a cut that quietly becomes a different,
@@ -674,6 +725,10 @@ impl App {
             OutFormat::Same => {
                 if mode == Mode::Video && !matches!(info.ext.as_str(), "mp4" | "m4v" | "mov" | "mkv") {
                     "mp4".to_string()
+                } else if volume.is_some() && !matches!(info.ext.as_str(), "mp4" | "m4v" | "mov" | "mkv") {
+                    // A volume change re-encodes the sound, and the safe
+                    // codec for that is AAC - which AVI and WMV cannot hold.
+                    "mkv".to_string()
                 } else {
                     info.ext.clone()
                 }
@@ -691,7 +746,8 @@ impl App {
         };
         // GIF and either audio format are a decision about the output itself,
         // so choosing one is always something to save.
-        let can_save = gif || audio || cropped || trim_changed || !self.keep_metadata || !self.keep_audio;
+        let can_save =
+            gif || audio || cropped || trim_changed || !self.keep_metadata || !self.keep_audio || volume.is_some();
         // The picture is not written at all when only the sound is, so a box
         // drawn on it changes nothing.
         let crop_px = if cropped && !audio { Some(self.crop.to_pixels(info.width, info.height)) } else { None };
@@ -700,7 +756,7 @@ impl App {
             None => (info.width, info.height),
         };
         let gif = if gif { Some(self.quality.gif_opts(gw, gh)) } else { None };
-        Some(Plan { mode, cropped, trim_changed, can_save, warn, out_ext, eff_start, dur, crop_px, gif })
+        Some(Plan { mode, cropped, trim_changed, can_save, warn, out_ext, eff_start, dur, crop_px, volume, gif })
     }
 
     fn start_export(&mut self, ctx: &egui::Context) {
@@ -769,11 +825,12 @@ impl App {
                 && (ffmpeg::audio_needs_aac(&info, &plan.out_ext)
                     || (plan.mode == Mode::Video && plan.out_ext == "mkv")),
             gif: plan.gif,
-            mp3_kbps: if plan.mode == Mode::Audio && self.format == OutFormat::Mp3 {
+            audio_kbps: if plan.mode == Mode::Audio && self.format == OutFormat::Mp3 {
                 Some(self.quality.mp3_kbps())
             } else {
                 None
             },
+            volume: plan.volume,
         };
         let cancel = Arc::new(AtomicBool::new(false));
         self.export = Some(Exporting { progress: 0.0, cancel: cancel.clone() });
@@ -1142,6 +1199,36 @@ impl App {
                     // screen; unticking it stops the sound there too.
                     self.start_sound(self.pos, true);
                 }
+                // The preview's loudness - and, with the box further along the
+                // format row ticked, the saved file's too. The slider keeps its
+                // own number hidden: the box beside it is the same value, and
+                // it can be typed into.
+                let loudness = ui
+                    .add_enabled(
+                        has_sound,
+                        egui::Slider::new(&mut self.volume, 0.0..=200.0)
+                            .suffix("%")
+                            .fixed_decimals(0)
+                            .show_value(false),
+                    )
+                    .on_hover_text(
+                        "Loudness of the preview. Tick *Apply current volume level to output* to use it \
+                         in the saved file as well.",
+                    )
+                    .on_disabled_hover_text("This video has no audio track.");
+                let typed = ui
+                    .add_enabled(
+                        has_sound,
+                        egui::DragValue::new(&mut self.volume)
+                            .range(0.0..=200.0)
+                            .suffix("%")
+                            .max_decimals(0)
+                            .speed(1.0),
+                    )
+                    .on_hover_text("The same volume as the slider: type it, or drag.");
+                if loudness.changed() || typed.changed() {
+                    self.volume_changed();
+                }
                 ui.separator();
                 if ui.button("Set start").on_hover_text("Trim start = current position").clicked() {
                     self.start = self.pos.min(self.end - 0.05).max(0.0);
@@ -1243,6 +1330,24 @@ impl App {
                 ui.add_enabled(!gif && !audio_only, egui::Checkbox::new(&mut self.keep_audio, "Keep audio"))
                     .on_hover_text("Off: the sound is dropped and the file is written without an audio track.")
                     .on_disabled_hover_text("A GIF has no sound, and an audio export is the sound itself.");
+                // The slider's volume, used for the saved file. Off by default:
+                // a save that only rewrites tags must not touch the sound.
+                let gain_possible = !gif && info.a_codec.is_some() && (audio_only || self.keep_audio);
+                ui.add_enabled(
+                    gain_possible,
+                    egui::Checkbox::new(&mut self.apply_volume, "Apply current volume level to output"),
+                )
+                .on_hover_text(
+                    "Writes the saved file's sound at the volume above, from silence to twice as loud. \
+                     The audio is re-encoded; the picture is not re-encoded for it.",
+                )
+                .on_disabled_hover_text(if gif {
+                    "A GIF has no sound."
+                } else if info.a_codec.is_none() {
+                    "This video has no audio track."
+                } else {
+                    "Tick Keep audio to keep the sound."
+                });
             });
         });
 
@@ -1262,15 +1367,29 @@ impl App {
             }
             if p.mode == Mode::Audio {
                 let codec = info.a_codec.as_deref().unwrap_or("the sound");
+                let level = p.volume.map(|g| format!(", volume {}", pct(g))).unwrap_or_default();
                 let text = if self.format == OutFormat::Mp3 {
                     format!(
-                        "Audio only: {codec} converted to MP3 at {} kbps. No picture is written.",
+                        "Audio only: {codec} converted to MP3 at {} kbps{level}. No picture is written.",
                         self.quality.mp3_kbps()
                     )
+                } else if p.volume.is_some() {
+                    format!("Audio only: {codec} re-encoded into .{}{level}. No picture is written.", p.out_ext)
                 } else {
                     format!("Audio only: {codec} copied as it is into .{}. No picture is written.", p.out_ext)
                 };
                 ui.label(RichText::new(text).weak());
+            }
+            if let Some(g) = p.volume {
+                if p.mode != Mode::Audio {
+                    ui.label(
+                        RichText::new(format!(
+                            "Sound at {}: the audio is re-encoded, the picture is not.",
+                            pct(g)
+                        ))
+                        .weak(),
+                    );
+                }
             }
             if p.trim_changed {
                 ui.label(RichText::new(format!("Output length {}", fmt_time(p.dur))).weak());
@@ -1418,6 +1537,23 @@ impl App {
             }
         }
 
+        // Up and down move the volume in whole steps of 5% - the same number
+        // the slider and its box show. The keyboard's own repeat drives this:
+        // every repeat event is one step, so a held key runs at a steady speed
+        // and never accelerates, and the ends of the range simply stop it.
+        let has_sound = self.info.as_ref().is_some_and(|i| i.a_codec.is_some());
+        if has_sound && self.export.is_none() {
+            let (up, down) = ctx.input_mut(|i| {
+                (
+                    i.count_and_consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp),
+                    i.count_and_consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown),
+                )
+            });
+            if up != down {
+                self.nudge_volume(up as f32 - down as f32);
+            }
+        }
+
         // Dropped files.
         let dropped = ctx.input(|i| i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).next());
         if let Some(p) = dropped {
@@ -1497,6 +1633,28 @@ mod tests {
             let st = Command::new(&b.ffmpeg)
                 .args(["-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=30"])
                 .args(["-t", "2", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-an"])
+                .arg(&p)
+                .status()
+                .unwrap();
+            assert!(st.success());
+            p
+        })
+        .clone()
+    }
+
+    /// A source in a container finnCrop would not write itself: asking for a
+    /// volume change on it has to move the file somewhere the re-encoded
+    /// sound fits.
+    fn make_avi() -> PathBuf {
+        static SRC: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        SRC.get_or_init(|| {
+            let dir = std::env::temp_dir().join("vc_ui_tests");
+            std::fs::create_dir_all(&dir).unwrap();
+            let p = dir.join("ui_src.avi");
+            let b = ffmpeg::find_bins().unwrap();
+            let st = Command::new(&b.ffmpeg)
+                .args(["-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=30", "-f", "lavfi", "-i", "sine=frequency=440"])
+                .args(["-t", "2", "-c:v", "mpeg4", "-c:a", "libmp3lame"])
                 .arg(&p)
                 .status()
                 .unwrap();
@@ -1609,6 +1767,54 @@ mod tests {
             step(&mut app, &ctx, &mut t, vec![key(egui::Key::ArrowLeft)]);
         }
         assert_eq!(app.pos, 0.0);
+    }
+
+    /// The keyboard's own repeat is what carries a held arrow key: each repeat
+    /// is one step, so the speed stays the same however long it is held.
+    #[test]
+    fn the_up_and_down_arrows_step_the_volume() {
+        let ctx = egui::Context::default();
+        let mut app = App::with_ctx(&ctx);
+        let mut t = 0.0;
+        step(&mut app, &ctx, &mut t, vec![]);
+        wait_until(&mut app, &ctx, &mut t, "ffmpeg", |a| a.bins().is_some());
+
+        app.open(&ctx, make_src());
+        wait_until(&mut app, &ctx, &mut t, "preview", |a| a.info.is_some() && a.texture.is_some());
+        assert_eq!(app.volume, 100.0);
+
+        let key = |k, repeat| Event::Key {
+            key: k,
+            physical_key: None,
+            pressed: true,
+            repeat,
+            modifiers: Modifiers::NONE,
+        };
+        let (up, down) = (egui::Key::ArrowUp, egui::Key::ArrowDown);
+
+        step(&mut app, &ctx, &mut t, vec![key(up, false)]);
+        assert_eq!(app.volume, 105.0);
+        step(&mut app, &ctx, &mut t, vec![key(up, true)]);
+        assert_eq!(app.volume, 110.0, "a repeat is a step like any other");
+        // Two repeats caught in one frame are two steps, not one.
+        step(&mut app, &ctx, &mut t, vec![key(up, true), key(up, true)]);
+        assert_eq!(app.volume, 120.0);
+        step(&mut app, &ctx, &mut t, vec![key(down, false)]);
+        assert_eq!(app.volume, 115.0);
+
+        // The ends of the slider stop it, and the number stays whole.
+        for _ in 0..30 {
+            step(&mut app, &ctx, &mut t, vec![key(up, true)]);
+        }
+        assert_eq!(app.volume, 200.0);
+        for _ in 0..50 {
+            step(&mut app, &ctx, &mut t, vec![key(down, true)]);
+        }
+        assert_eq!(app.volume, 0.0);
+
+        // The keys move the shared number only: they do not opt the save in.
+        assert!(!app.apply_volume, "the arrows must not tick the format row box");
+        assert!(app.plan().unwrap().volume.is_none());
     }
 
     #[test]
@@ -2042,5 +2248,63 @@ mod tests {
         app.open(&ctx, src);
         wait_until(&mut app, &ctx, &mut t, "reopen", |a| a.texture.is_some() && a.info.is_some());
         assert!(app.crop.is_full(640.0, 360.0) && app.start == 0.0);
+    }
+
+    /// The output volume is opted into, and only for a sound that is kept:
+    /// unticked, at 100%, with the track dropped, or for a GIF it changes
+    /// nothing at all.
+    #[test]
+    fn the_output_volume_is_opted_into_and_only_for_kept_sound() {
+        let ctx = egui::Context::default();
+        let mut app = App::with_ctx(&ctx);
+        let mut t = 0.0;
+        step(&mut app, &ctx, &mut t, vec![]);
+        wait_until(&mut app, &ctx, &mut t, "ffmpeg", |a| a.bins().is_some());
+
+        app.open(&ctx, make_src());
+        wait_until(&mut app, &ctx, &mut t, "preview", |a| a.info.is_some() && a.texture.is_some());
+
+        app.volume = 150.0;
+        assert!(!app.apply_volume, "the box starts off");
+        assert!(app.plan().unwrap().volume.is_none(), "unticked, the save leaves the sound alone");
+        assert!(!app.plan().unwrap().can_save, "and nothing else changed either");
+
+        app.apply_volume = true;
+        let p = app.plan().unwrap();
+        assert_eq!(p.volume, Some(1.5));
+        assert!(p.can_save, "a volume change alone is something to save");
+        assert_eq!(p.mode, Mode::Remux, "the picture is copied, only the sound is re-encoded");
+        assert_eq!(p.out_ext, "mp4");
+
+        app.volume = 100.0;
+        assert!(app.plan().unwrap().volume.is_none(), "100% is no change");
+        app.volume = 150.0;
+
+        app.keep_audio = false;
+        assert!(app.plan().unwrap().volume.is_none(), "a dropped track has no volume");
+        app.keep_audio = true;
+
+        app.format = OutFormat::Audio;
+        assert_eq!(app.plan().unwrap().volume, Some(1.5), "an audio export takes it too");
+
+        app.format = OutFormat::Gif;
+        assert!(app.plan().unwrap().volume.is_none(), "a GIF has no sound to turn");
+
+        // A cut carries it too, and the sound is encoded into the video file.
+        app.format = OutFormat::Same;
+        app.start = 1.0;
+        app.end = 2.0;
+        let p = app.plan().unwrap();
+        assert_eq!((p.mode, p.volume), (Mode::Video, Some(1.5)));
+
+        // A container that cannot hold AAC becomes MKV rather than failing.
+        app.open(&ctx, make_avi());
+        wait_until(&mut app, &ctx, &mut t, "avi preview", |a| {
+            a.info.as_ref().map(|i| i.ext == "avi").unwrap_or(false) && a.texture.is_some()
+        });
+        let p = app.plan().unwrap();
+        assert_eq!((p.mode, p.out_ext.as_str()), (Mode::Remux, "mkv"), "AAC does not fit in AVI");
+        assert!(p.warn.is_none(), "{:?}", p.warn);
+        assert!(p.can_save, "the volume is the change being saved");
     }
 }

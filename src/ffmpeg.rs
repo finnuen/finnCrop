@@ -482,9 +482,10 @@ pub enum Mode {
     Remux,
     /// Animated GIF: palette built in one pass, encoded in a second.
     Gif,
-    /// The sound only: the picture is dropped. With `Job::mp3_kbps` set it is
+    /// The sound only: the picture is dropped. With `Job::audio_kbps` set it is
     /// re-encoded to MP3; otherwise it is stream-copied into whichever
-    /// container its codec calls for (see `audio_ext`).
+    /// container its codec calls for (see `audio_ext`). `Job::volume` forces a
+    /// re-encode into that container with `audio_encoder`.
     Audio,
 }
 
@@ -525,11 +526,47 @@ pub struct Job {
     pub gif: Option<GifOpts>,
     /// Set for `Mode::Audio`: `Some(kbps)` encodes MP3 at that bitrate, `None`
     /// copies the source stream as it is. Ignored in every other mode.
-    pub mp3_kbps: Option<u32>,
+    pub audio_kbps: Option<u32>,
+    /// A gain to apply to the sound (`-af volume`). Asking for one forces the
+    /// audio to be re-encoded, since a copied stream cannot be filtered.
+    pub volume: Option<f64>,
 }
 
 macro_rules! push_args {
     ($v:ident; $($x:expr),* $(,)?) => { $( $v.push(OsString::from($x)); )* };
+}
+
+/// The gain as ffmpeg reads it: a plain decimal with no trailing zeros, so the
+/// arguments say `volume=1.5` rather than `volume=1.500`.
+fn gain_text(gain: f64) -> String {
+    let mut s = format!("{gain:.3}");
+    if s.contains('.') {
+        let n = s.trim_end_matches('0').trim_end_matches('.').len();
+        s.truncate(n);
+    }
+    s
+}
+
+/// The encoder a re-encoded audio export uses, chosen by the container its
+/// extension names. A copy cannot be turned down, so the sound has to be
+/// decoded and encoded again, into something the container actually holds.
+pub fn audio_encoder(ext: &str) -> &'static str {
+    match ext {
+        "mp3" => "libmp3lame",
+        "opus" => "libopus",
+        "ogg" => "libvorbis",
+        "flac" => "flac",
+        "wav" => "pcm_s16le",
+        "ac3" => "ac3",
+        "eac3" => "eac3",
+        // .m4a and .mka both take AAC, and it is the safe answer elsewhere.
+        _ => "aac",
+    }
+}
+
+/// FLAC and PCM have no bitrate to set, and asking for one makes ffmpeg fail.
+fn encoder_takes_bitrate(enc: &str) -> bool {
+    !matches!(enc, "flac" | "pcm_s16le")
 }
 
 pub fn build_args(job: &Job) -> Vec<OsString> {
@@ -552,6 +589,8 @@ pub fn build_args(job: &Job) -> Vec<OsString> {
             push_args!(a; "-c", "copy");
             if !job.keep_audio {
                 push_args!(a; "-an");
+            } else if let Some(gain) = job.volume {
+                push_args!(a; "-af", format!("volume={}", gain_text(gain)), "-c:a", "aac", "-b:a", "192k");
             } else if job.audio_aac {
                 push_args!(a; "-c:a", "aac", "-b:a", "192k");
             }
@@ -565,6 +604,8 @@ pub fn build_args(job: &Job) -> Vec<OsString> {
             push_args!(a; "-c:v", "libx264", "-crf", job.crf.to_string(), "-preset", "fast", "-pix_fmt", "yuv420p");
             if !job.keep_audio {
                 push_args!(a; "-an");
+            } else if let Some(gain) = job.volume {
+                push_args!(a; "-af", format!("volume={}", gain_text(gain)), "-c:a", "aac", "-b:a", "192k");
             } else if job.audio_aac {
                 push_args!(a; "-c:a", "aac", "-b:a", "192k");
             } else {
@@ -573,12 +614,22 @@ pub fn build_args(job: &Job) -> Vec<OsString> {
         }
         Mode::Audio => {
             push_args!(a; "-map", "0:a:0", "-vn", "-sn", "-dn");
-            match job.mp3_kbps {
-                Some(kbps) => {
+            match (job.volume, job.audio_kbps) {
+                (None, Some(kbps)) => {
                     push_args!(a; "-c:a", "libmp3lame", "-b:a", format!("{kbps}k"));
                 }
-                None => {
+                (None, None) => {
                     push_args!(a; "-c:a", "copy");
+                }
+                (Some(gain), kbps) => {
+                    // The container decides the codec. The quality step is a
+                    // bitrate only for the MP3 export; everything else gets
+                    // the usual 192k when its encoder takes one at all.
+                    let enc = audio_encoder(&ext);
+                    push_args!(a; "-af", format!("volume={}", gain_text(gain)), "-c:a", enc);
+                    if encoder_takes_bitrate(enc) {
+                        push_args!(a; "-b:a", format!("{}k", kbps.unwrap_or(192)));
+                    }
                 }
             }
             // A copied stream keeps the timestamps it was cut at; the export
@@ -815,6 +866,10 @@ mod tests {
         String::from_utf8_lossy(&o.stdout).to_string()
     }
 
+    fn joined(args: &[OsString]) -> String {
+        args.iter().map(|a| a.to_string_lossy().to_string()).collect::<Vec<_>>().join(" ")
+    }
+
     fn job(input: &Path, out: &Path, mode: Mode, start: f64, dur: f64, crop: Option<(u32, u32, u32, u32)>, keep: bool) -> Job {
         Job {
             input: input.to_path_buf(),
@@ -828,7 +883,8 @@ mod tests {
             audio_aac: false,
             keep_audio: true,
             gif: None,
-            mp3_kbps: None,
+            audio_kbps: None,
+            volume: None,
         }
     }
 
@@ -1183,7 +1239,7 @@ mod tests {
         for (name, kbps) in [("sound_320.mp3", 320u32), ("sound_128.mp3", 128u32)] {
             let out = tmp(name);
             let mut j = job(&src, &out, Mode::Audio, 1.0, 3.0, None, true);
-            j.mp3_kbps = Some(kbps);
+            j.audio_kbps = Some(kbps);
             export(&b, &j, &c, &|_| {}).unwrap();
 
             let d = dump(&b, &out);
@@ -1199,6 +1255,114 @@ mod tests {
             sizes.push(std::fs::metadata(&out).unwrap().len());
         }
         assert!(sizes[0] > sizes[1] * 2, "320k and 128k came out {} and {} bytes", sizes[0], sizes[1]);
+    }
+
+    /// A volume cannot be applied to a copied stream, so asking for one moves
+    /// the sound to an encoder and leaves the picture alone. The container an
+    /// audio export names is what picks that encoder.
+    #[test]
+    fn a_volume_forces_the_audio_to_be_encoded() {
+        let src = Path::new("in.mp4");
+
+        let mut j = job(src, Path::new("out.mp4"), Mode::Remux, 0.0, 5.0, None, true);
+        j.volume = Some(0.5);
+        let a = joined(&build_args(&j));
+        assert!(a.contains("-c copy"), "the picture should still be copied: {a}");
+        assert!(a.contains("-c:a aac"), "{a}");
+        assert!(a.contains("-af volume=0.5"), "{a}");
+        assert!(a.contains("-b:a 192k"), "{a}");
+
+        // FLAC is lossless, so there is no bitrate to ask for.
+        let mut j = job(src, Path::new("sound.flac"), Mode::Audio, 0.0, 5.0, None, true);
+        j.volume = Some(1.5);
+        let a = joined(&build_args(&j));
+        assert!(a.contains("-c:a flac"), "{a}");
+        assert!(a.contains("-af volume=1.5"), "{a}");
+        assert!(!a.contains("-b:a"), "FLAC has no bitrate: {a}");
+
+        // MP3 keeps the quality step's bitrate.
+        let mut j = job(src, Path::new("sound.mp3"), Mode::Audio, 0.0, 5.0, None, true);
+        j.volume = Some(2.0);
+        j.audio_kbps = Some(128);
+        let a = joined(&build_args(&j));
+        assert!(a.contains("-c:a libmp3lame"), "{a}");
+        assert!(a.contains("-af volume=2"), "{a}");
+        assert!(a.contains("-b:a 128k"), "{a}");
+    }
+
+    #[test]
+    fn audio_export_encoder_follows_the_container() {
+        assert_eq!(audio_encoder("m4a"), "aac");
+        assert_eq!(audio_encoder("mka"), "aac");
+        assert_eq!(audio_encoder("mp3"), "libmp3lame");
+        assert_eq!(audio_encoder("opus"), "libopus");
+        assert_eq!(audio_encoder("ogg"), "libvorbis");
+        assert_eq!(audio_encoder("flac"), "flac");
+        assert_eq!(audio_encoder("wav"), "pcm_s16le");
+        assert_eq!(audio_encoder("ac3"), "ac3");
+        assert_eq!(audio_encoder("eac3"), "eac3");
+        assert!(encoder_takes_bitrate("aac"));
+        assert!(encoder_takes_bitrate("libopus"));
+        assert!(!encoder_takes_bitrate("flac"));
+        assert!(!encoder_takes_bitrate("pcm_s16le"));
+        // No exponent and no trailing zeros in what ffmpeg is handed.
+        assert_eq!(gain_text(1.0), "1");
+        assert_eq!(gain_text(0.5), "0.5");
+        assert_eq!(gain_text(1.37), "1.37");
+        assert_eq!(gain_text(0.0), "0");
+        assert_eq!(gain_text(2.0), "2");
+    }
+
+    /// The volume is really in the file, not only in the arguments: the same
+    /// tone exported at half and at double comes back about 12 dB apart.
+    #[test]
+    fn volume_scales_the_sound_in_the_export() {
+        let b = bins();
+        let src = tmp("quiet_tone.m4a");
+        let st = Command::new(&b.ffmpeg)
+            .args(["-v", "error", "-y", "-f", "lavfi", "-i", "aevalsrc=0.1*sin(2*PI*440*t):s=48000:d=2"])
+            .args(["-c:a", "aac"])
+            .arg(&src)
+            .status()
+            .unwrap();
+        assert!(st.success());
+
+        let c = AtomicBool::new(false);
+        let mean = |name: &str, gain: f64| {
+            let out = tmp(name);
+            let mut j = job(&src, &out, Mode::Audio, 0.0, 2.0, None, true);
+            j.volume = Some(gain);
+            export(&b, &j, &c, &|_| {}).unwrap();
+            let d = dump(&b, &out);
+            assert!(d.contains("codec_name=aac"), "{d}");
+
+            let o = Command::new(&b.ffmpeg)
+                .args(["-v", "info", "-i"])
+                .arg(&out)
+                .args(["-af", "volumedetect", "-f", "null", "-"])
+                .output()
+                .unwrap();
+            let text = String::from_utf8_lossy(&o.stderr).to_string();
+            let line = text
+                .lines()
+                .find(|l| l.contains("mean_volume"))
+                .unwrap_or_else(|| panic!("volumedetect said nothing useful:\n{text}"));
+            line.split("mean_volume:")
+                .nth(1)
+                .unwrap()
+                .trim()
+                .trim_end_matches(" dB")
+                .parse::<f64>()
+                .unwrap()
+        };
+
+        let quiet = mean("vol_half.m4a", 0.5);
+        let loud = mean("vol_double.m4a", 2.0);
+        assert!(
+            (loud - quiet - 12.04).abs() < 1.5,
+            "half to double moved the mean by {:.2} dB ({quiet:.2} -> {loud:.2})",
+            loud - quiet
+        );
     }
 
     #[test]

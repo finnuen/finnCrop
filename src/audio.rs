@@ -14,7 +14,7 @@ use std::ffi::OsString;
 use std::io::Read;
 use std::path::Path;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -34,6 +34,14 @@ const CHUNK: usize = 8192;
 /// Buffers kept in flight, so one slow read does not leave a gap in the sound.
 const BUFFERS: usize = 4;
 
+/// The preview's loudness, held in thousandths so the window and the sound
+/// thread can share it without a lock: 1000 is the source as it is, 2000 is
+/// twice as loud.
+const GAIN_ONE: u32 = 1000;
+/// 200%: the top of the slider. waveOutSetVolume cannot go past 100%, which is
+/// why the scaling happens to the samples before the card sees them.
+const GAIN_MAX: u32 = 2000;
+
 /// The sound for one playback: from `from` to `until`, 16-bit stereo.
 ///
 /// Created when playback starts, dropped when it stops. The thread waits for
@@ -44,6 +52,8 @@ pub struct Sound {
     begun: Arc<AtomicBool>,
     cancel: Arc<AtomicBool>,
     child: Arc<Mutex<Option<std::process::Child>>>,
+    /// Thousandths of the source's loudness, read afresh for every buffer.
+    gain: Arc<AtomicU32>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -51,10 +61,10 @@ impl Sound {
     /// Starts decoding and returns at once; nothing is heard until [`begin`].
     ///
     /// [`begin`]: Sound::begin
-    pub fn start(bins: &Bins, path: &Path, from: f64, until: f64) -> Res<Self> {
+    pub fn start(bins: &Bins, path: &Path, from: f64, until: f64, gain: f32) -> Res<Self> {
         #[cfg(not(windows))]
         {
-            let _ = (bins, path, from, until);
+            let _ = (bins, path, from, until, gain);
             return Err("Sound is played on Windows only".to_string());
         }
 
@@ -75,14 +85,16 @@ impl Sound {
 
             let begun = Arc::new(AtomicBool::new(false));
             let cancel = Arc::new(AtomicBool::new(false));
+            let level = Arc::new(AtomicU32::new(to_milli(gain)));
             let thread = {
-                let (b, c) = (begun.clone(), cancel.clone());
-                std::thread::spawn(move || sink(pcm, device, b, c))
+                let (b, c, g) = (begun.clone(), cancel.clone(), level.clone());
+                std::thread::spawn(move || sink(pcm, device, b, c, g))
             };
             Ok(Self {
                 begun,
                 cancel,
                 child: Arc::new(Mutex::new(Some(child))),
+                gain: level,
                 thread: Some(thread),
             })
         }
@@ -91,6 +103,12 @@ impl Sound {
     /// The first picture is on screen: let the sound follow it.
     pub fn begin(&self) {
         self.begun.store(true, Ordering::Relaxed);
+    }
+
+    /// Changes the loudness while it plays. The next buffer is filled at the
+    /// new level, ramped across its ~43 ms so a drag glides instead of clicking.
+    pub fn set_gain(&self, gain: f32) {
+        self.gain.store(to_milli(gain), Ordering::Relaxed);
     }
 
     /// Stops the sound now. Safe to call more than once; also runs on drop.
@@ -157,6 +175,56 @@ fn read_upto(r: &mut impl Read, buf: &mut [u8]) -> usize {
         }
     }
     n
+}
+
+/// A gain as thousandths, clamped to what the slider offers.
+fn to_milli(gain: f32) -> u32 {
+    ((gain as f64 * GAIN_ONE as f64).round() as i64).clamp(0, GAIN_MAX as i64) as u32
+}
+
+/// One sample at one gain. Rounded to the nearest step and clipped rather than
+/// wrapped: a boosted sample that runs out of range becomes the loudest the
+/// format can hold, which is what a volume control should do.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn scaled(v: i16, milli: u32) -> i16 {
+    if milli == GAIN_ONE {
+        return v;
+    }
+    let x = v as i32 * milli as i32;
+    let half = GAIN_ONE as i32 / 2;
+    let r = if x >= 0 { (x + half) / GAIN_ONE as i32 } else { (x - half) / GAIN_ONE as i32 };
+    r.clamp(i16::MIN as i32, i16::MAX as i32) as i16
+}
+
+/// Scales a whole buffer, ramping from the level it last had to the one asked
+/// for, so a moving slider glides instead of stepping at buffer boundaries.
+/// Both channels of a frame always get the same gain. Returns the level the
+/// next buffer starts from.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn apply_gain(buf: &mut [u8], from: u32, to: u32) -> u32 {
+    let frames = buf.len() / BLOCK;
+    if frames == 0 {
+        return to;
+    }
+    if from == to && from == GAIN_ONE {
+        return to;
+    }
+    let span = to as i64 - from as i64;
+    for f in 0..frames {
+        let milli = if frames == 1 {
+            to
+        } else {
+            // The last frame lands exactly on the new level.
+            (from as i64 + span * f as i64 / (frames as i64 - 1)) as u32
+        };
+        let o = f * BLOCK;
+        for ch in 0..CHANNELS as usize {
+            let i = o + ch * 2;
+            let v = i16::from_le_bytes([buf[i], buf[i + 1]]);
+            buf[i..i + 2].copy_from_slice(&scaled(v, milli).to_le_bytes());
+        }
+    }
+    to
 }
 
 #[cfg(windows)]
@@ -369,7 +437,13 @@ impl Drop for Device {
 
 /// The thread: waits for the picture, then feeds the card from the pipe.
 #[cfg(windows)]
-fn sink(mut pcm: impl Read, mut device: Device, begun: Arc<AtomicBool>, cancel: Arc<AtomicBool>) {
+fn sink(
+    mut pcm: impl Read,
+    mut device: Device,
+    begun: Arc<AtomicBool>,
+    cancel: Arc<AtomicBool>,
+    gain: Arc<AtomicU32>,
+) {
     while !begun.load(Ordering::Relaxed) {
         if cancel.load(Ordering::Relaxed) {
             return;
@@ -377,6 +451,7 @@ fn sink(mut pcm: impl Read, mut device: Device, begun: Arc<AtomicBool>, cancel: 
         std::thread::sleep(Duration::from_millis(2));
     }
 
+    let mut milli = gain.load(Ordering::Relaxed);
     let mut buf = vec![0u8; CHUNK];
     loop {
         if cancel.load(Ordering::Relaxed) {
@@ -386,6 +461,10 @@ fn sink(mut pcm: impl Read, mut device: Device, begun: Arc<AtomicBool>, cancel: 
         if n == 0 {
             break; // end of the trimmed range
         }
+        // Read the slider once per buffer: the ramp then covers the whole
+        // hand-over, and a fast drag makes one smooth step per 43 ms.
+        let now = gain.load(Ordering::Relaxed);
+        milli = apply_gain(&mut buf[..n], milli, now);
         if !device.play(&buf[..n], &cancel) {
             return;
         }
@@ -470,6 +549,60 @@ mod tests {
         assert!(joined.contains("-ac 2"), "{joined}");
         assert!(joined.contains("-ar 48000"), "{joined}");
         assert!(joined.ends_with("-f s16le -"), "{joined}");
+    }
+
+    /// The preview's volume is applied to the samples by hand: half is half,
+    /// double is double, and a boosted sample that runs out of range clips at
+    /// the top of the scale instead of wrapping round to noise. 100% must be
+    /// bit-exact, or a video with the slider left alone would be altered.
+    #[test]
+    fn the_gain_scales_samples_and_clips() {
+        assert_eq!(scaled(1000, 500), 500);
+        assert_eq!(scaled(1000, 2000), 2000);
+        assert_eq!(scaled(-1000, 500), -500);
+        assert_eq!(scaled(20000, 2000), i16::MAX);
+        assert_eq!(scaled(-20000, 2000), i16::MIN);
+        assert_eq!(scaled(1234, GAIN_ONE), 1234);
+        assert_eq!(scaled(-1234, GAIN_ONE), -1234);
+        assert_eq!(scaled(1234, 0), 0);
+        // Out-of-range requests are clamped to the slider's range, not obeyed.
+        assert_eq!(to_milli(2.5), GAIN_MAX);
+        assert_eq!(to_milli(-1.0), 0);
+        assert_eq!(to_milli(1.0), GAIN_ONE);
+    }
+
+    /// A moved slider ramps across the buffer rather than stepping: the first
+    /// frame at the level it had, the last at the level asked for, and both
+    /// channels of a frame together so the picture does not wander between
+    /// the speakers.
+    #[test]
+    fn the_gain_moves_along_the_buffer_without_a_step() {
+        let frames = 4;
+        let mut buf = vec![0u8; frames * BLOCK];
+        for f in 0..frames {
+            for ch in 0..CHANNELS as usize {
+                let i = f * BLOCK + ch * 2;
+                buf[i..i + 2].copy_from_slice(&1000i16.to_le_bytes());
+            }
+        }
+
+        let next = apply_gain(&mut buf, 1000, 2000);
+        assert_eq!(next, 2000, "the next buffer must start where this one ended");
+
+        let at = |f: usize, ch: usize| {
+            let i = f * BLOCK + ch * 2;
+            i16::from_le_bytes([buf[i], buf[i + 1]])
+        };
+        let heard: Vec<i16> = (0..frames).map(|f| at(f, 0)).collect();
+        assert_eq!(heard, vec![1000, 1333, 1666, 2000]);
+        for f in 0..frames {
+            assert_eq!(at(f, 0), at(f, 1), "frame {f} has a different gain on each channel");
+        }
+
+        // 100% is a copy: the samples come back untouched.
+        let before = buf.clone();
+        apply_gain(&mut buf, GAIN_ONE, GAIN_ONE);
+        assert_eq!(buf, before);
     }
 
     /// The winmm half, as far as a machine without ears can check it: a short
