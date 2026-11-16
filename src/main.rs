@@ -7,6 +7,7 @@ mod crop;
 mod ffmpeg;
 mod settings;
 mod timeline;
+mod update;
 
 /// The program's name, spelled the one way it is spelled everywhere.
 pub const APP_NAME: &str = "finnCrop";

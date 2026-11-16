@@ -6,10 +6,7 @@
 
 **Crop a region of a video and cut it - exactly where you asked.**
 
-![version](https://img.shields.io/badge/version-1.13-blue)
-![licence](https://img.shields.io/badge/licence-Apache--2.0-blue)
-![platform](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-lightgrey)
-![download](https://img.shields.io/badge/download-204%20MB-lightgrey)
+![version](https://img.shields.io/badge/version-1.14-blue) ![licence](https://img.shields.io/badge/licence-Apache--2.0-blue) ![platform](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-lightgrey) ![download](https://img.shields.io/badge/download-204%20MB-lightgrey)
 
 </div>
 
@@ -26,7 +23,7 @@ with x264 and the audio is copied untouched wherever the container allows it,
 so only what has to change does.
 
 It is also one file. FFmpeg and ffprobe travel inside the exe and are unpacked
-once to `%LOCALAPPDATA%\finnCrop\ffmpeg\1.13\`, so there is no installer, no
+once to `%LOCALAPPDATA%\finnCrop\ffmpeg\1.14\`, so there is no installer, no
 admin rights, and no DLL sitting beside it.
 
 ## Download
@@ -34,9 +31,15 @@ admin rights, and no DLL sitting beside it.
 [finnCrop.exe](https://github.com/finnuen/finnCrop/releases/latest) — 204 MB, 64-bit Windows 10 or 11.
 
 Nothing to install: put it wherever you keep programs and run it. The first
-start takes a few seconds longer than the ones after it, because about 205 MB
+start takes a few seconds longer than the ones after it, because about 200 MB
 has to be unpacked and virus-checked. Deleting that `%LOCALAPPDATA%` folder is
 harmless — it is written again on the next start.
+
+Updating is replacing the file: download the new `finnCrop.exe` and drop it over
+the old one, and the shortcut, the icon and the *Open with* entry keep working
+because the name does not change. finnCrop tells you when there is something new
+— see the update note under *Notes* — but it never downloads or installs
+anything itself.
 
 ## How to use
 
@@ -68,13 +71,30 @@ harmless — it is written again on the next start.
    steps, and holding one keeps stepping as the keyboard repeats.
 5. **Save…** — the original file is never overwritten.
 
+The rows under the timeline, left to right: **Play** and **Sound** with the
+volume box; **Set start** with the trim's first frame, the playhead's
+**Position**, the trim's last frame with **Set end**, then **Reset trim** and
+**Disable video smoothing**. Below them, **Aspect** with its five presets,
+**Reset crop**, and the crop box's size and corner in source pixels; then
+**Format**, the quality step, **Keep metadata**, **Keep audio**, and **Apply
+current volume level to output**.
+
 ## Modes
+
+*Format*, in the last row of the controls, is where the output is chosen:
+*Same as source* keeps the file's own container, or pick MP4, MKV or MOV, *GIF*
+for a silent looping clip, *Extract audio* for the soundtrack in the container
+its codec belongs to, or *MP3* for it re-encoded.
+
+<div align="center">
+<img src="docs/screenshot-format.png" width="240" alt="The Format menu: Same as source, MP4, MKV, MOV, GIF, Extract audio, MP3">
+</div>
 
 The mode is picked for you and shown under the controls:
 
 | Mode | When | What it does |
 | --- | --- | --- |
-| **Cut** | always | picture re-encoded with x264, audio copied unless *Keep audio* is off (converted to AAC in MKV), quality selectable |
+| **Cut** | always | picture re-encoded with x264, audio copied unless *Keep audio* is off or the container cannot play it (Opus or Vorbis into MP4/MOV is converted to AAC), quality selectable |
 | **Crop** | the box is smaller than the frame | the same, plus the picture is cropped |
 | **GIF** | format *GIF* | re-encoded to a palette, loops forever, no sound, no metadata |
 | **Audio** | format *Extract audio* or *MP3* | the sound alone, trimmed but never cropped; no picture is written |
@@ -104,6 +124,15 @@ The mode is picked for you and shown under the controls:
   copied stream cannot be filtered — so the audio is written again as AAC while
   the picture is left exactly as it would have been; at 100% nothing is
   re-encoded.
+- **It says when there is a newer release.** Once per start, and only if the
+  switch in *About* is on, finnCrop asks `api.github.com` for the newest release
+  and puts `v1.15 is available` beside the *About* button if there is one; the
+  line is a link to the release page. Nothing is downloaded — the new exe is
+  dropped over the old one — and nothing about you, your machine or the file
+  that is open is sent: one GET, with the repository's name in the path. A
+  machine with no network simply hears nothing. The switch is remembered as
+  `update=off` in `%LOCALAPPDATA%\finnCrop\settings.txt`, and off means the
+  program does not go on the network at all.
 - **Extracting the sound.** *Extract audio* copies the track untouched into the
   container its codec belongs to: `.m4a` for AAC and ALAC, `.mp3`, `.opus`,
   `.ogg` for Vorbis, `.flac`, `.wav` for PCM, and `.mka` for anything with no
@@ -149,7 +178,7 @@ embeds.
 Rust with the `x86_64-pc-windows-gnu` toolchain:
 
 ```powershell
-.\build.ps1                 # release build, version bumped (1.13 -> 1.14)
+.\build.ps1                 # release build, version bumped (1.14 -> 1.15)
 .\build.ps1 -Debug          # debug build, fast, ffmpeg read from vendor\
 .\build.ps1 -KeepVersion    # rebuild the same version
 .\build.ps1 -Version 2.0    # set the version outright
@@ -157,7 +186,7 @@ Rust with the `x86_64-pc-windows-gnu` toolchain:
 
 `Cargo.toml` holds the version and nothing else does; the script writes it into
 the build's name, the exe's version block, the title bar and the About window.
-The result is `dist\finnCrop_v1.13.exe`, about 205 MB with FFmpeg inside.
+The result is `dist\finnCrop_v1.14.exe`, about 205 MB with FFmpeg inside.
 
 The first build downloads FFmpeg once (about 110 MB), from the one pinned 9.0.2
 package, and packs it into the executable. The download is checked against a

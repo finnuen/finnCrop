@@ -15,12 +15,15 @@ pub struct Settings {
     /// The *Sound* switch. Off starts the next run silent; what is saved is
     /// never affected either way.
     pub sound_on: bool,
+    /// Whether the start of a run asks GitHub for a newer release. On, because
+    /// a program nobody is told about is a program that is never updated.
+    pub update_on: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         // On, because a video that is played should sound like one.
-        Self { sound_on: true }
+        Self { sound_on: true, update_on: true }
     }
 }
 
@@ -48,7 +51,11 @@ impl Settings {
     }
 
     fn text(&self) -> String {
-        format!("sound={}\n", if self.sound_on { "on" } else { "off" })
+        format!(
+            "sound={}\nupdate={}\n",
+            if self.sound_on { "on" } else { "off" },
+            if self.update_on { "on" } else { "off" }
+        )
     }
 
     /// Reads what [`Settings::text`] writes, ignoring comments, blank lines,
@@ -63,8 +70,11 @@ impl Settings {
             let Some((key, value)) = line.split_once('=') else {
                 continue;
             };
-            if key.trim() == "sound" {
-                s.sound_on = !matches!(value.trim(), "off" | "false" | "0");
+            let on = !matches!(value.trim(), "off" | "false" | "0");
+            match key.trim() {
+                "sound" => s.sound_on = on,
+                "update" => s.update_on = on,
+                _ => {}
             }
         }
         s
@@ -87,14 +97,26 @@ mod tests {
     #[test]
     fn the_sound_switch_survives_a_round_trip() {
         for sound_on in [true, false] {
-            let s = Settings { sound_on };
+            let s = Settings { sound_on, ..Settings::default() };
             assert_eq!(Settings::parse(&s.text()), s, "sound_on {sound_on}");
         }
     }
 
     #[test]
+    fn the_update_switch_survives_a_round_trip() {
+        for update_on in [true, false] {
+            let s = Settings { update_on, ..Settings::default() };
+            assert_eq!(Settings::parse(&s.text()), s, "update_on {update_on}");
+        }
+        // One switch is written and read without disturbing the other.
+        let s = Settings { sound_on: false, update_on: false };
+        assert_eq!(Settings::parse(&s.text()), s);
+    }
+
+    #[test]
     fn a_missing_or_odd_file_falls_back_to_the_defaults() {
         assert!(Settings::default().sound_on, "a fresh install plays sound");
+        assert!(Settings::default().update_on, "a fresh install checks for updates");
         assert_eq!(Settings::parse(""), Settings::default());
         // Junk, a comment, and a key from a newer version: none of them is an
         // error, and none of them changes what this version understands.
@@ -103,5 +125,10 @@ mod tests {
         assert!(!Settings::parse("sound = false\n").sound_on);
         assert!(!Settings::parse("sound=0\n").sound_on);
         assert!(Settings::parse("sound=on\n").sound_on);
+        assert!(!Settings::parse("update=off\n").update_on);
+        assert!(!Settings::parse("update=0\n").update_on);
+        // A file written before the check existed has no `update` line, and
+        // gains the default rather than turning the check off.
+        assert!(Settings::parse("sound=off\n").update_on);
     }
 }

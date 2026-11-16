@@ -3,6 +3,7 @@ use crate::crop::{self, Aspect, CropRect, Handle};
 use crate::ffmpeg::{self, Bins, Job, Mode, VideoInfo};
 use crate::settings;
 use crate::timeline;
+use crate::update;
 use crate::version_line;
 use eframe::egui::{self, pos2, vec2, Color32, CursorIcon, Pos2, Rect, RichText, Sense, Stroke, Vec2};
 use std::path::{Path, PathBuf};
@@ -36,6 +37,8 @@ enum Msg {
     Keyframes(u64, Vec<f64>),
     Progress(f32),
     Done(Result<PathBuf, String>),
+    /// The start-up question to GitHub, answered.
+    Update(update::Checked),
 }
 
 /// FFmpeg is prepared on a worker thread: on the first run the two packed
@@ -210,6 +213,12 @@ pub struct App {
     sound: Option<audio::Sound>,
     /// The *Sound* switch, which only affects the preview.
     sound_on: bool,
+    /// Whether this run asks GitHub whether a newer release exists. Remembered
+    /// between runs, and off means no request leaves the machine at all.
+    update_on: bool,
+    /// What that question found, once it has been answered. `None` means it is
+    /// still in flight, or was never asked.
+    update: Option<update::Checked>,
     /// The preview's loudness in percent, 0..=200. It is also the volume the
     /// save applies when *Apply current volume level to output* is ticked.
     volume: f32,
@@ -271,10 +280,30 @@ fn reveal(path: &Path) {
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let mut app = Self::with_ctx(&cc.egui_ctx);
-        // The one setting that is remembered from the last run. Tests build the
-        // window through `with_ctx`, so they never touch the real file.
-        app.sound_on = settings::Settings::load().sound_on;
+        // The settings that are remembered from the last run. Tests build the
+        // window through `with_ctx`, so they never touch the real file, and the
+        // check below is only ever started by the real program: a test run must
+        // not go asking GitHub questions.
+        let saved = settings::Settings::load();
+        app.sound_on = saved.sound_on;
+        app.update_on = saved.update_on;
+        if app.update_on {
+            app.start_update_check(&cc.egui_ctx);
+        }
         app
+    }
+
+    /// Asks GitHub, on a thread of its own, whether a newer release exists. The
+    /// window is drawn meanwhile; the answer arrives as a message.
+    fn start_update_check(&mut self, ctx: &egui::Context) {
+        let (tx, ctx) = (self.tx.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let found = update::check(crate::VERSION);
+            let _ = tx.send(Msg::Update(found));
+            // The link appears when this lands, without waiting for the pointer
+            // to move over the window.
+            ctx.request_repaint();
+        });
     }
 
     fn with_ctx(ctx: &egui::Context) -> Self {
@@ -312,6 +341,8 @@ impl App {
             player: None,
             sound: None,
             sound_on: true,
+            update_on: true,
+            update: None,
             volume: 100.0,
             volume_notches: 0.0,
             volume_box: Rect::NOTHING,
@@ -470,6 +501,7 @@ impl App {
                     }
                 }
                 Msg::Keyframes(g, k) if g == self.gen => self.keyframes = k,
+                Msg::Update(found) => self.update = Some(found),
                 Msg::Progress(p) => {
                     if let Some(e) = &mut self.export {
                         e.progress = p;
@@ -972,6 +1004,25 @@ impl App {
                 if ui.button("About").clicked() {
                     self.about_open = true;
                 }
+                // A newer release is one line, and the line is the link. It is
+                // only drawn while the check is on: switching the check off
+                // stops the program asking, and stops it pointing.
+                if self.update_on {
+                    if let Some(update::Checked::Newer(release)) = &self.update {
+                        let text = RichText::new(format!("v{} is available", release.tag))
+                            .color(Color32::from_rgb(130, 190, 250));
+                        if ui
+                            .add(egui::Link::new(text))
+                            .on_hover_text(
+                                "Opens the release page in your browser. finnCrop downloads nothing \
+                                 itself: the new exe goes over the old one.",
+                            )
+                            .clicked()
+                        {
+                            update::open_in_browser(&release.url);
+                        }
+                    }
+                }
             });
         });
         // The version stays visible even when a file is open, so the title bar
@@ -1272,9 +1323,9 @@ impl App {
                     .on_hover_text("Plays the soundtrack with the preview. The switch is remembered.")
                     .on_disabled_hover_text("This video has no audio track.");
                 if sound.changed() {
-                    // The one switch that says how the program should behave
-                    // before a file is open, so it outlives the session.
-                    settings::Settings { sound_on: self.sound_on }.save();
+                    // The switches that say how the program should behave
+                    // before a file is open, so they outlive the session.
+                    settings::Settings { sound_on: self.sound_on, update_on: self.update_on }.save();
                     if self.is_playing() {
                         // Ticking it mid-play starts the sound at the frame on
                         // screen; unticking it stops the sound there too.
@@ -1568,6 +1619,65 @@ impl App {
                 ui.add_space(2.0);
                 ui.label("Cutting and cropping for video files.");
                 ui.label(RichText::new("Copyright 2026 finnuen. Apache License 2.0.").weak());
+
+                ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(6.0);
+                ui.label(RichText::new("Updates").strong());
+                // What the start-up question found, said plainly, including
+                // when it found nothing or could not be asked.
+                if !self.update_on {
+                    ui.label(RichText::new("Update checks are off.").weak());
+                } else {
+                    match &self.update {
+                        None => {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label("Asking GitHub for the newest release...");
+                            });
+                        }
+                        Some(update::Checked::Current) => {
+                            ui.label("No newer release is published.");
+                        }
+                        Some(update::Checked::Newer(release)) => {
+                            ui.horizontal(|ui| {
+                                ui.label(format!("v{} is available.", release.tag));
+                                if ui.link("Open the release page").clicked() {
+                                    update::open_in_browser(&release.url);
+                                }
+                            });
+                            ui.label(
+                                RichText::new(
+                                    "Nothing is downloaded: the new finnCrop.exe goes over the old \
+                                     one, so the name, the shortcut and the icon stay as they are.",
+                                )
+                                .weak(),
+                            );
+                        }
+                        Some(update::Checked::Failed(why)) => {
+                            ui.label("Could not check for a newer release.");
+                            ui.label(RichText::new(why.clone()).weak());
+                        }
+                    }
+                }
+                let mut on = self.update_on;
+                if ui
+                    .checkbox(&mut on, "Check for a newer release when finnCrop starts")
+                    .on_hover_text(
+                        "One request to api.github.com, with nothing about you or your file in it. \
+                         Off: the program does not go on the network at all.",
+                    )
+                    .changed()
+                {
+                    self.update_on = on;
+                    settings::Settings { sound_on: self.sound_on, update_on: on }.save();
+                    // Turning it back on answers the question straight away,
+                    // rather than at the next start.
+                    self.update = None;
+                    if on {
+                        self.start_update_check(ctx);
+                    }
+                }
 
                 ui.add_space(10.0);
                 ui.separator();
@@ -2267,6 +2377,46 @@ mod tests {
         step(&mut app, &ctx, &mut t, vec![]);
         app.about_open = true;
         step(&mut app, &ctx, &mut t, vec![]);
+        step(&mut app, &ctx, &mut t, vec![]);
+        assert!(app.about_open);
+    }
+
+    /// The update check belongs to the real program: a test run builds its
+    /// window through `with_ctx`, and must not go asking GitHub anything.
+    #[test]
+    fn a_test_window_asks_github_nothing() {
+        let ctx = egui::Context::default();
+        let mut app = App::with_ctx(&ctx);
+        let mut t = 0.0;
+        step(&mut app, &ctx, &mut t, vec![]);
+        assert!(app.update.is_none(), "a check was started, or an answer arrived");
+        assert!(app.update_on, "the switch starts on");
+    }
+
+    /// Each answer the check can give draws, in the window and in About. What
+    /// is being guarded is the drawing: a state that cannot be laid out is a
+    /// window that does not open.
+    #[test]
+    fn every_answer_the_check_can_give_draws() {
+        let ctx = egui::Context::default();
+        let mut app = App::with_ctx(&ctx);
+        let mut t = 0.0;
+        step(&mut app, &ctx, &mut t, vec![]);
+        app.about_open = true;
+        let release = update::Release {
+            tag: "9.9".to_string(),
+            url: "https://github.com/finnuen/finnCrop/releases/tag/9.9".to_string(),
+        };
+        for answer in [
+            update::Checked::Current,
+            update::Checked::Newer(release),
+            update::Checked::Failed("GitHub answered 403".to_string()),
+        ] {
+            app.update = Some(answer);
+            step(&mut app, &ctx, &mut t, vec![]);
+        }
+        // The switch off draws too, with nothing offered beside *About*.
+        app.update_on = false;
         step(&mut app, &ctx, &mut t, vec![]);
         assert!(app.about_open);
     }
