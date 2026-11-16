@@ -413,6 +413,24 @@ pub fn audio_needs_aac(info: &VideoInfo, out_ext: &str) -> bool {
     mov_family && matches!(info.a_codec.as_deref(), Some("opus") | Some("vorbis"))
 }
 
+/// Container for "extract audio, same as source". The source codec decides:
+/// a copy into a container that cannot hold it would have to be re-encoded,
+/// and that is no longer the same sound.
+pub fn audio_ext(codec: &str) -> &'static str {
+    match codec {
+        "aac" | "alac" => "m4a",
+        "mp3" => "mp3",
+        "opus" => "opus",
+        "vorbis" => "ogg",
+        "flac" => "flac",
+        "ac3" => "ac3",
+        "eac3" => "eac3",
+        c if c.starts_with("pcm_") => "wav",
+        // Matroska audio carries everything else untouched.
+        _ => "mka",
+    }
+}
+
 pub fn copy_compat(info: &VideoInfo, out_ext: &str) -> Option<String> {
     let mov_family = matches!(out_ext, "mp4" | "m4v" | "mov");
     if mov_family {
@@ -462,6 +480,10 @@ pub enum Mode {
     Remux,
     /// Animated GIF: palette built in one pass, encoded in a second.
     Gif,
+    /// The sound only: the picture is dropped. With `Job::mp3_kbps` set it is
+    /// re-encoded to MP3; otherwise it is stream-copied into whichever
+    /// container its codec calls for (see `audio_ext`).
+    Audio,
 }
 
 /// Geometry and frame rate for a GIF export. GIF has no audio and no 24-bit
@@ -499,6 +521,9 @@ pub struct Job {
     pub keep_audio: bool,
     /// Set for `Mode::Gif`.
     pub gif: Option<GifOpts>,
+    /// Set for `Mode::Audio`: `Some(kbps)` encodes MP3 at that bitrate, `None`
+    /// copies the source stream as it is. Ignored in every other mode.
+    pub mp3_kbps: Option<u32>,
 }
 
 macro_rules! push_args {
@@ -508,12 +533,16 @@ macro_rules! push_args {
 pub fn build_args(job: &Job) -> Vec<OsString> {
     let mut a: Vec<OsString> = Vec::new();
     let ext = job.output.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
-    let mov_family = matches!(ext.as_str(), "mp4" | "m4v" | "mov");
+    // m4a is the MP4 container under another name, so it takes the same flags.
+    let mov_family = matches!(ext.as_str(), "mp4" | "m4v" | "mov" | "m4a");
 
     push_args!(a; "-hide_banner", "-loglevel", "error", "-y", "-ss", fmt_secs(job.start), "-i", job.input.clone());
-    push_args!(a; "-t", fmt_secs(job.dur), "-map", "0:v:0");
-    if job.keep_audio {
-        push_args!(a; "-map", "0:a?");
+    push_args!(a; "-t", fmt_secs(job.dur));
+    if job.mode != Mode::Audio {
+        push_args!(a; "-map", "0:v:0");
+        if job.keep_audio {
+            push_args!(a; "-map", "0:a?");
+        }
     }
 
     match job.mode {
@@ -540,9 +569,36 @@ pub fn build_args(job: &Job) -> Vec<OsString> {
                 push_args!(a; "-c:a", "copy");
             }
         }
+        Mode::Audio => {
+            push_args!(a; "-map", "0:a:0", "-vn", "-sn", "-dn");
+            match job.mp3_kbps {
+                Some(kbps) => {
+                    push_args!(a; "-c:a", "libmp3lame", "-b:a", format!("{kbps}k"));
+                }
+                None => {
+                    push_args!(a; "-c:a", "copy");
+                }
+            }
+            // A copied stream keeps the timestamps it was cut at; the export
+            // should begin at zero like a re-encoded one does.
+            push_args!(a; "-avoid_negative_ts", "make_zero");
+        }
     }
 
-    if job.keep_metadata {
+    if job.mode == Mode::Audio {
+        if job.keep_metadata {
+            push_args!(a; "-map_metadata", "0");
+            if mov_family {
+                push_args!(a; "-movflags", "+faststart+use_metadata_tags");
+            }
+        } else {
+            push_args!(a; "-map_metadata", "-1", "-map_metadata:s:a", "-1");
+            push_args!(a; "-fflags", "+bitexact", "-flags:a", "+bitexact");
+            if mov_family {
+                push_args!(a; "-movflags", "+faststart");
+            }
+        }
+    } else if job.keep_metadata {
         push_args!(a; "-map_metadata", "0", "-map_chapters", "0");
         if mov_family {
             push_args!(a; "-movflags", "+faststart+use_metadata_tags");
@@ -770,6 +826,7 @@ mod tests {
             audio_aac: false,
             keep_audio: true,
             gif: None,
+            mp3_kbps: None,
         }
     }
 
@@ -1041,6 +1098,105 @@ mod tests {
         let info = probe(&b, &remux).unwrap();
         assert!(info.a_codec.is_none(), "the remux still has audio: {:?}", info.a_codec);
         assert_eq!(info.v_codec, "h264", "the picture should have been copied, not re-encoded");
+    }
+
+    #[test]
+    fn audio_ext_follows_the_codec() {
+        assert_eq!(audio_ext("aac"), "m4a");
+        assert_eq!(audio_ext("alac"), "m4a");
+        assert_eq!(audio_ext("mp3"), "mp3");
+        assert_eq!(audio_ext("opus"), "opus");
+        assert_eq!(audio_ext("vorbis"), "ogg");
+        assert_eq!(audio_ext("flac"), "flac");
+        assert_eq!(audio_ext("ac3"), "ac3");
+        assert_eq!(audio_ext("pcm_s16le"), "wav");
+        // Nothing else has a container of its own, and Matroska audio takes it.
+        assert_eq!(audio_ext("dts"), "mka");
+        assert_eq!(audio_ext("wmav2"), "mka");
+    }
+
+    /// "Extract audio, same as source" must really copy: the packets in the
+    /// file are the source's own, which a hash of the stream proves. A
+    /// re-encode would look identical in a codec listing.
+    #[test]
+    fn extracted_audio_is_a_copy_of_the_source() {
+        let b = bins();
+        let src = make_video();
+        let out = tmp("sound.m4a");
+        let c = AtomicBool::new(false);
+        export(&b, &job(&src, &out, Mode::Audio, 0.0, 12.0, None, true), &c, &|_| {}).unwrap();
+
+        let d = dump(&b, &out);
+        assert!(d.contains("codec_name=aac"), "{d}");
+        assert!(d.contains("codec_type=audio"), "{d}");
+        assert!(!d.contains("codec_type=video"), "an audio export still has a picture:\n{d}");
+
+        let hash = |p: &Path| {
+            let o = Command::new(&b.ffmpeg)
+                .args(["-v", "error", "-i"])
+                .arg(p)
+                .args(["-map", "0:a:0", "-c", "copy", "-f", "md5", "-"])
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&o.stdout).trim().to_string()
+        };
+        assert_eq!(hash(&src), hash(&out), "the sound was re-encoded, not copied");
+    }
+
+    /// A codec with a container of its own goes into that container, not into
+    /// Matroska by default: FLAC becomes .flac, and it is still a copy.
+    #[test]
+    fn flac_audio_goes_into_a_flac_file() {
+        let b = bins();
+        let src = tmp("src_flac.mkv");
+        let st = Command::new(&b.ffmpeg)
+            .args(["-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=30"])
+            .args(["-f", "lavfi", "-i", "sine=frequency=440"])
+            .args(["-t", "3", "-c:v", "libx264", "-c:a", "flac"])
+            .arg(&src)
+            .status()
+            .unwrap();
+        assert!(st.success());
+        let info = probe(&b, &src).unwrap();
+        assert_eq!(info.a_codec.as_deref(), Some("flac"));
+        assert_eq!(audio_ext("flac"), "flac");
+
+        let out = tmp("sound.flac");
+        let c = AtomicBool::new(false);
+        export(&b, &job(&src, &out, Mode::Audio, 0.0, 3.0, None, true), &c, &|_| {}).unwrap();
+        let d = dump(&b, &out);
+        assert!(d.contains("codec_name=flac"), "{d}");
+        assert!(!d.contains("codec_type=video"), "{d}");
+    }
+
+    /// MP3 is the one audio export that re-encodes, and the quality step is
+    /// its bitrate: the same cut at 320k and 128k must not come out the same
+    /// size.
+    #[test]
+    fn mp3_export_re_encodes_at_the_chosen_bitrate() {
+        let b = bins();
+        let src = make_video();
+        let c = AtomicBool::new(false);
+        let mut sizes = Vec::new();
+        for (name, kbps) in [("sound_320.mp3", 320u32), ("sound_128.mp3", 128u32)] {
+            let out = tmp(name);
+            let mut j = job(&src, &out, Mode::Audio, 1.0, 3.0, None, true);
+            j.mp3_kbps = Some(kbps);
+            export(&b, &j, &c, &|_| {}).unwrap();
+
+            let d = dump(&b, &out);
+            assert!(d.contains("codec_name=mp3"), "{d}");
+            assert!(!d.contains("codec_type=video"), "{d}");
+            let o = Command::new(&b.ffprobe)
+                .args(["-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0"])
+                .arg(&out)
+                .output()
+                .unwrap();
+            let dur: f64 = String::from_utf8_lossy(&o.stdout).trim().parse().unwrap();
+            assert!((dur - 3.0).abs() < 0.2, "{name}: dur {dur}");
+            sizes.push(std::fs::metadata(&out).unwrap().len());
+        }
+        assert!(sizes[0] > sizes[1] * 2, "320k and 128k came out {} and {} bytes", sizes[0], sizes[1]);
     }
 
     #[test]

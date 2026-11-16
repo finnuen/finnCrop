@@ -36,6 +36,10 @@ enum OutFormat {
     Mkv,
     Mov,
     Gif,
+    /// The sound alone, copied into the container its codec calls for.
+    Audio,
+    /// The sound alone, re-encoded to MP3.
+    Mp3,
 }
 
 impl OutFormat {
@@ -46,7 +50,14 @@ impl OutFormat {
             OutFormat::Mkv => "MKV",
             OutFormat::Mov => "MOV",
             OutFormat::Gif => "GIF",
+            OutFormat::Audio => "Extract audio",
+            OutFormat::Mp3 => "MP3",
         }
+    }
+
+    /// True for the two formats that write the sound and no picture.
+    fn is_audio(self) -> bool {
+        matches!(self, OutFormat::Audio | OutFormat::Mp3)
     }
 }
 
@@ -70,6 +81,17 @@ impl Quality {
             Quality::High => 18,
             Quality::Medium => 23,
             Quality::Small => 28,
+        }
+    }
+
+    /// The same three steps as an MP3 bitrate: MP3 has no constant-quality
+    /// mode worth exposing, and 320/192/128 covers "keep it", "normal" and
+    /// "small enough to send".
+    fn mp3_kbps(self) -> u32 {
+        match self {
+            Quality::High => 320,
+            Quality::Medium => 192,
+            Quality::Small => 128,
         }
     }
 
@@ -570,6 +592,7 @@ impl App {
         let cropped = !self.crop.is_full(fw, fh);
         let trim_changed = self.start > 0.001 || self.end < info.duration - 0.001;
         let gif = self.format == OutFormat::Gif;
+        let audio = self.format.is_audio();
         // Cutting re-encodes the picture. A stream copy can only begin on a
         // keyframe, so it cannot start where the trim says unless the trim
         // happens to land on one - and a cut that quietly becomes a different,
@@ -578,6 +601,8 @@ impl App {
         // and no crop, only the tags being rewritten.
         let mode = if gif {
             Mode::Gif
+        } else if audio {
+            Mode::Audio
         } else if trim_changed || cropped {
             Mode::Video
         } else {
@@ -589,6 +614,13 @@ impl App {
             OutFormat::Mp4 => "mp4".to_string(),
             OutFormat::Mkv => "mkv".to_string(),
             OutFormat::Mov => "mov".to_string(),
+            OutFormat::Mp3 => "mp3".to_string(),
+            // "Same as source" for the sound is the source codec's own
+            // container. Without a codec there is nothing to extract and the
+            // warning below stops the save, so the extension is a placeholder.
+            OutFormat::Audio => {
+                info.a_codec.as_deref().map(ffmpeg::audio_ext).unwrap_or("m4a").to_string()
+            }
             OutFormat::Same => {
                 if mode == Mode::Video && !matches!(info.ext.as_str(), "mp4" | "m4v" | "mov" | "mkv") {
                     "mp4".to_string()
@@ -600,10 +632,19 @@ impl App {
 
         let eff_start = self.start;
         let dur = (self.end - eff_start).max(0.05);
-        let warn = if mode == Mode::Remux { ffmpeg::copy_compat(info, &out_ext) } else { None };
-        // GIF is always a re-encode, so there is always something to save.
-        let can_save = gif || cropped || trim_changed || !self.keep_metadata || !self.keep_audio;
-        let crop_px = if cropped { Some(self.crop.to_pixels(info.width, info.height)) } else { None };
+        let warn = if audio && info.a_codec.is_none() {
+            Some("This video has no audio track to extract.".to_string())
+        } else if mode == Mode::Remux {
+            ffmpeg::copy_compat(info, &out_ext)
+        } else {
+            None
+        };
+        // GIF and either audio format are a decision about the output itself,
+        // so choosing one is always something to save.
+        let can_save = gif || audio || cropped || trim_changed || !self.keep_metadata || !self.keep_audio;
+        // The picture is not written at all when only the sound is, so a box
+        // drawn on it changes nothing.
+        let crop_px = if cropped && !audio { Some(self.crop.to_pixels(info.width, info.height)) } else { None };
         let (gw, gh) = match crop_px {
             Some((w, h, _, _)) => (w, h),
             None => (info.width, info.height),
@@ -617,7 +658,9 @@ impl App {
             return;
         };
         let stem = info.path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "video".into());
-        let suffix = if plan.cropped {
+        let suffix = if plan.mode == Mode::Audio {
+            "_audio"
+        } else if plan.cropped {
             "_cropped"
         } else if plan.mode == Mode::Gif {
             "_gif"
@@ -626,7 +669,11 @@ impl App {
         } else {
             "_clean"
         };
-        let filter = if plan.mode == Mode::Gif { "GIF" } else { "Video" };
+        let filter = match plan.mode {
+            Mode::Gif => "GIF",
+            Mode::Audio => "Audio",
+            _ => "Video",
+        };
         let mut dlg = rfd::FileDialog::new()
             .set_file_name(format!("{stem}{suffix}.{}", plan.out_ext))
             .add_filter(filter, &[plan.out_ext.as_str()]);
@@ -668,9 +715,15 @@ impl App {
             // picture starts where the cut began while the sound starts at
             // zero, and the two sit however far the trim started from apart.
             audio_aac: self.keep_audio
+                && plan.mode != Mode::Audio
                 && (ffmpeg::audio_needs_aac(&info, &plan.out_ext)
                     || (plan.mode == Mode::Video && plan.out_ext == "mkv")),
             gif: plan.gif,
+            mp3_kbps: if plan.mode == Mode::Audio && self.format == OutFormat::Mp3 {
+                Some(self.quality.mp3_kbps())
+            } else {
+                None
+            },
         };
         let cancel = Arc::new(AtomicBool::new(false));
         self.export = Some(Exporting { progress: 0.0, cancel: cancel.clone() });
@@ -1088,19 +1141,33 @@ impl App {
             ui.horizontal_wrapped(|ui| {
                 ui.label("Format:");
                 egui::ComboBox::from_id_salt("format").selected_text(self.format.label()).show_ui(ui, |ui| {
-                    for f in [OutFormat::Same, OutFormat::Mp4, OutFormat::Mkv, OutFormat::Mov, OutFormat::Gif] {
+                    for f in [
+                        OutFormat::Same,
+                        OutFormat::Mp4,
+                        OutFormat::Mkv,
+                        OutFormat::Mov,
+                        OutFormat::Gif,
+                        OutFormat::Audio,
+                        OutFormat::Mp3,
+                    ] {
                         ui.selectable_value(&mut self.format, f, f.label());
                     }
                 });
-                let reencode = plan.as_ref().map(|p| p.mode == Mode::Video).unwrap_or(false);
+                let reencode = plan
+                    .as_ref()
+                    .map(|p| p.mode == Mode::Video || (p.mode == Mode::Audio && self.format == OutFormat::Mp3))
+                    .unwrap_or(false);
                 ui.add_enabled_ui(reencode, |ui| {
                     egui::ComboBox::from_id_salt("quality").selected_text(self.quality.label()).show_ui(ui, |ui| {
                         for q in [Quality::High, Quality::Medium, Quality::Small] {
                             ui.selectable_value(&mut self.quality, q, q.label());
                         }
                     });
-                });
+                })
+                .response
+                .on_hover_text("The picture's frame rate and size, or the MP3 bitrate.");
                 let gif = plan.as_ref().map(|p| p.mode == Mode::Gif).unwrap_or(false);
+                let audio_only = plan.as_ref().map(|p| p.mode == Mode::Audio).unwrap_or(false);
                 ui.add_enabled(
                     !gif,
                     egui::Checkbox::new(&mut self.keep_metadata, "Keep metadata"),
@@ -1109,9 +1176,9 @@ impl App {
                     "Off: removes tags such as title, creation date, GPS location and encoder info.\nVideo and audio are not re-encoded just for this.",
                 )
                 .on_disabled_hover_text("A GIF has no place to keep the tags.");
-                ui.add_enabled(!gif, egui::Checkbox::new(&mut self.keep_audio, "Keep audio"))
+                ui.add_enabled(!gif && !audio_only, egui::Checkbox::new(&mut self.keep_audio, "Keep audio"))
                     .on_hover_text("Off: the sound is dropped and the file is written without an audio track.")
-                    .on_disabled_hover_text("A GIF has no sound to keep.");
+                    .on_disabled_hover_text("A GIF has no sound, and an audio export is the sound itself.");
             });
         });
 
@@ -1128,6 +1195,18 @@ impl App {
                         g.width, g.height, g.fps, g.colors
                     ),
                 );
+            }
+            if p.mode == Mode::Audio {
+                let codec = info.a_codec.as_deref().unwrap_or("the sound");
+                let text = if self.format == OutFormat::Mp3 {
+                    format!(
+                        "Audio only: {codec} converted to MP3 at {} kbps. No picture is written.",
+                        self.quality.mp3_kbps()
+                    )
+                } else {
+                    format!("Audio only: {codec} copied as it is into .{}. No picture is written.", p.out_ext)
+                };
+                ui.label(RichText::new(text).weak());
             }
             if p.trim_changed {
                 ui.label(RichText::new(format!("Output length {}", fmt_time(p.dur))).weak());
@@ -1342,6 +1421,37 @@ mod tests {
             p
         })
         .clone()
+    }
+
+    fn make_silent_src() -> PathBuf {
+        static SRC: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        SRC.get_or_init(|| {
+            let dir = std::env::temp_dir().join("vc_ui_tests");
+            std::fs::create_dir_all(&dir).unwrap();
+            let p = dir.join("ui_silent.mp4");
+            let b = ffmpeg::find_bins().unwrap();
+            let st = Command::new(&b.ffmpeg)
+                .args(["-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=30"])
+                .args(["-t", "2", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-an"])
+                .arg(&p)
+                .status()
+                .unwrap();
+            assert!(st.success());
+            p
+        })
+        .clone()
+    }
+
+    /// ffprobe's stream text, for the audio exports `probe` cannot read back:
+    /// it insists on a video stream, which these files deliberately lack.
+    fn probe_raw(p: &Path) -> String {
+        let b = ffmpeg::find_bins().unwrap();
+        let o = Command::new(&b.ffprobe)
+            .args(["-v", "error", "-show_streams", "-show_format", "-of", "default"])
+            .arg(p)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&o.stdout).to_string()
     }
 
     #[test]
@@ -1706,6 +1816,81 @@ mod tests {
             }
         );
         assert!(out.exists());
+    }
+
+    #[test]
+    fn the_audio_formats_write_the_sound_and_no_picture() {
+        let ctx = egui::Context::default();
+        let mut app = App::with_ctx(&ctx);
+        let mut t = 0.0;
+        step(&mut app, &ctx, &mut t, vec![]);
+        wait_until(&mut app, &ctx, &mut t, "ffmpeg", |a| a.bins().is_some());
+
+        app.open(&ctx, make_src());
+        wait_until(&mut app, &ctx, &mut t, "preview", |a| a.texture.is_some());
+
+        // A box on the picture means nothing to the sound, and picking an audio
+        // format is itself something to save.
+        app.crop = crop::fit_aspect(640.0, 360.0, 1.0);
+        app.format = OutFormat::Audio;
+        let p = app.plan().unwrap();
+        assert_eq!(p.mode, Mode::Audio);
+        assert_eq!(p.out_ext, "m4a", "AAC is copied into .m4a");
+        assert!(p.crop_px.is_none(), "a crop must not follow the sound out");
+        assert!(p.can_save, "choosing an audio format is a change");
+        assert!(p.warn.is_none(), "{:?}", p.warn);
+
+        app.start = 1.0;
+        app.end = 3.0;
+        let out = std::env::temp_dir().join("vc_ui_tests").join("ui_sound.m4a");
+        let _ = std::fs::remove_file(&out);
+        app.begin_export(&ctx, out.clone());
+        step(&mut app, &ctx, &mut t, vec![]);
+        wait_until(&mut app, &ctx, &mut t, "audio export", |a| a.export.is_none());
+        assert!(
+            matches!(app.notice, Some(Notice::Saved(_))),
+            "notice: {:?}",
+            match &app.notice {
+                Some(Notice::Error(e)) => e.clone(),
+                _ => String::new(),
+            }
+        );
+        let d = probe_raw(&out);
+        assert!(d.contains("codec_name=aac"), "{d}");
+        assert!(d.contains("codec_type=audio"), "{d}");
+        assert!(!d.contains("codec_type=video"), "the export kept the picture:\n{d}");
+
+        // MP3 re-encodes, and the quality step is its bitrate.
+        app.format = OutFormat::Mp3;
+        app.quality = Quality::Small;
+        let p = app.plan().unwrap();
+        assert_eq!((p.mode, p.out_ext.as_str()), (Mode::Audio, "mp3"));
+        let out2 = std::env::temp_dir().join("vc_ui_tests").join("ui_sound.mp3");
+        let _ = std::fs::remove_file(&out2);
+        app.begin_export(&ctx, out2.clone());
+        step(&mut app, &ctx, &mut t, vec![]);
+        wait_until(&mut app, &ctx, &mut t, "mp3 export", |a| a.export.is_none());
+        let d = probe_raw(&out2);
+        assert!(d.contains("codec_name=mp3"), "{d}");
+        assert!(!d.contains("codec_type=video"), "{d}");
+    }
+
+    #[test]
+    fn extracting_audio_from_a_silent_video_is_refused() {
+        let ctx = egui::Context::default();
+        let mut app = App::with_ctx(&ctx);
+        let mut t = 0.0;
+        step(&mut app, &ctx, &mut t, vec![]);
+        wait_until(&mut app, &ctx, &mut t, "ffmpeg", |a| a.bins().is_some());
+
+        app.open(&ctx, make_silent_src());
+        wait_until(&mut app, &ctx, &mut t, "preview", |a| a.info.is_some() && a.texture.is_some());
+        assert!(app.info.as_ref().unwrap().a_codec.is_none());
+
+        app.format = OutFormat::Audio;
+        let p = app.plan().unwrap();
+        assert!(!(p.can_save && p.warn.is_none()), "there is no sound to save");
+        assert_eq!(p.warn.as_deref(), Some("This video has no audio track to extract."));
     }
 
     #[test]

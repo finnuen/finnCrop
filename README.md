@@ -6,7 +6,7 @@
 
 **Crop a region of a video and cut it - exactly where you asked.**
 
-![version](https://img.shields.io/badge/version-1.9-blue)
+![version](https://img.shields.io/badge/version-1.10-blue)
 ![licence](https://img.shields.io/badge/licence-Apache--2.0-blue)
 ![platform](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-lightgrey)
 ![download](https://img.shields.io/badge/download-204%20MB-lightgrey)
@@ -26,7 +26,7 @@ with x264 and the audio is copied untouched wherever the container allows it,
 so only what has to change does.
 
 It is also one file. FFmpeg and ffprobe travel inside the exe and are unpacked
-once to `%LOCALAPPDATA%\finnCrop\ffmpeg\1.9\`, so there is no installer, no
+once to `%LOCALAPPDATA%\finnCrop\ffmpeg\1.10\`, so there is no installer, no
 admin rights, and no DLL sitting beside it.
 
 ## Download
@@ -71,6 +71,7 @@ The mode is picked for you and shown under the controls:
 | **Cut** | always | picture re-encoded with x264, audio copied unless *Keep audio* is off (converted to AAC in MKV), quality selectable |
 | **Crop** | the box is smaller than the frame | the same, plus the picture is cropped |
 | **GIF** | format *GIF* | re-encoded to a palette, loops forever, no sound, no metadata |
+| **Audio** | format *Extract audio* or *MP3* | the sound alone, trimmed but never cropped; no picture is written |
 
 ## Notes
 
@@ -81,6 +82,12 @@ The mode is picked for you and shown under the controls:
 - **The preview settings are preview only.** Zooming, panning, the whole-pixel
   drawing and the snapped crop edges change nothing in the file: the box decides
   what is written, and the picture is encoded from the source at full resolution.
+- **Extracting the sound.** *Extract audio* copies the track untouched into the
+  container its codec belongs to: `.m4a` for AAC and ALAC, `.mp3`, `.opus`,
+  `.ogg` for Vorbis, `.flac`, `.wav` for PCM, and `.mka` for anything with no
+  container of its own. *MP3* re-encodes it instead, at 320, 192 or 128 kbps
+  following the quality step. The crop box is ignored and the trim still
+  applies. A video with no audio track says so and refuses to save.
 - **GIF quality moves three things at once** — frame rate (15 / 12 / 10 fps),
   long side (800 / 640 / 480 px) and palette (256 / 192 / 128 colours). The
   picture is only ever made smaller, never bigger. A GIF is encoded in two
@@ -118,7 +125,7 @@ embeds.
 Rust with the `x86_64-pc-windows-gnu` toolchain:
 
 ```powershell
-.\build.ps1                 # release build, version bumped (1.9 -> 1.10)
+.\build.ps1                 # release build, version bumped (1.10 -> 1.11)
 .\build.ps1 -Debug          # debug build, fast, ffmpeg read from vendor\
 .\build.ps1 -KeepVersion    # rebuild the same version
 .\build.ps1 -Version 2.0    # set the version outright
@@ -126,7 +133,7 @@ Rust with the `x86_64-pc-windows-gnu` toolchain:
 
 `Cargo.toml` holds the version and nothing else does; the script writes it into
 the build's name, the exe's version block, the title bar and the About window.
-The result is `dist\finnCrop_v1.9.exe`, about 205 MB with FFmpeg inside.
+The result is `dist\finnCrop_v1.10.exe`, about 205 MB with FFmpeg inside.
 
 The first build downloads FFmpeg once (about 110 MB), from the one pinned 9.0.2
 package, and packs it into the executable. The download is checked against a
