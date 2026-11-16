@@ -18,10 +18,12 @@ const VIDEO_EXTS: &[&str] = &[
 /// moves the volume this far, in percent.
 const VOLUME_STEP: f32 = 5.0;
 
-/// How far one point of mouse movement turns the volume, in percent. Half a
-/// percent per point is half the speed egui's own drag would give: a whole
-/// percent is two pixels of travel, so an odd number is easy to land on.
-const VOLUME_PER_POINT: f32 = 0.5;
+/// How far one point of mouse movement turns the volume, in percent: a sixth
+/// of a percent, so a whole percent is six pixels of travel and the full
+/// 0-200% range takes about 1200 pixels of dragging - three times the travel
+/// egui's own drag would ask for, which is what makes a single odd number
+/// easy to land on.
+const VOLUME_PER_POINT: f32 = 1.0 / 6.0;
 
 /// A smooth wheel reports points rather than notches; this many of them are
 /// one notch.
@@ -2016,21 +2018,21 @@ mod tests {
             &mut t,
             vec![Event::PointerButton { pos: start, button: PointerButton::Primary, pressed: true, modifiers: m }],
         );
-        // Ten points right: the drag starts, and the mouse reports the same
-        // ten points of its own movement, because it really did move.
+        // Thirty points right: the drag starts, and the mouse reports the same
+        // thirty points of its own movement, because it really did move.
         step(
             &mut app,
             &ctx,
             &mut t,
-            vec![Event::PointerMoved(start + vec2(10.0, 0.0)), Event::MouseMoved(vec2(10.0, 0.0))],
+            vec![Event::PointerMoved(start + vec2(30.0, 0.0)), Event::MouseMoved(vec2(30.0, 0.0))],
         );
         assert!((app.volume - 105.0).abs() < 0.01, "volume {}", app.volume);
 
         // Now the pointer is against the edge of the screen and cannot move any
         // further, while the mouse under the hand keeps going right.
-        step(&mut app, &ctx, &mut t, vec![Event::MouseMoved(vec2(20.0, 0.0))]);
+        step(&mut app, &ctx, &mut t, vec![Event::MouseMoved(vec2(60.0, 0.0))]);
         assert!((app.volume - 115.0).abs() < 0.01, "volume {}", app.volume);
-        step(&mut app, &ctx, &mut t, vec![Event::MouseMoved(vec2(20.0, 0.0))]);
+        step(&mut app, &ctx, &mut t, vec![Event::MouseMoved(vec2(60.0, 0.0))]);
         assert!((app.volume - 125.0).abs() < 0.01, "volume {}", app.volume);
 
         // Letting go lands on a whole percent, and leaves the save alone.
