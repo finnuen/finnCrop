@@ -61,9 +61,11 @@ harmless — it is written again on the next start.
    a click on the picture, and moving the playhead stops it. *Sound*, beside the
    button, silences the preview without touching what is saved, and it is
    remembered for the next run. The box right of it sets how loud the preview
-   plays, from silence to twice the source's own level: drag it, or click and
-   type a number. <kbd>↑</kbd> and <kbd>↓</kbd> move that volume in 5% steps,
-   and holding one keeps stepping as the keyboard repeats.
+   plays, from silence to twice the source's own level: drag it, scroll over it
+   for 5% a notch, or click and type a number. A drag follows the mouse itself
+   rather than the pointer, so it keeps going when the pointer is pinned against
+   the edge of the screen. <kbd>↑</kbd> and <kbd>↓</kbd> move that volume in 5%
+   steps, and holding one keeps stepping as the keyboard repeats.
 5. **Save…** — the original file is never overwritten.
 
 ## Modes
@@ -94,9 +96,11 @@ The mode is picked for you and shown under the controls:
   run.
 - **The volume box is the sound's loudness.** Beside *Sound*, it runs from
   silence to twice the source's own level (0–200%). Drag it for slow, whole-odd
-  steps, or click it and type the number outright. *Apply current volume level to
-  output* in the format row uses the same number for the saved file instead of
-  only for the preview. Turning the sound up or down means re-encoding it — a
+  steps — the drag follows the mouse rather than the pointer, so it does not
+  stall when the pointer reaches the edge of the screen — scroll over it for 5%
+  a notch, or click it and type the number outright. *Apply current volume level
+  to output* in the format row uses the same number for the saved file instead
+  of only for the preview. Turning the sound up or down means re-encoding it — a
   copied stream cannot be filtered — so the audio is written again as AAC while
   the picture is left exactly as it would have been; at 100% nothing is
   re-encoded.

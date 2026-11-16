@@ -14,8 +14,18 @@ const VIDEO_EXTS: &[&str] = &[
     "mp4", "m4v", "mov", "mkv", "webm", "avi", "wmv", "flv", "3gp", "mpg", "mpeg", "ts", "mts", "m2ts", "ogv", "gif",
 ];
 
-/// One press of the up or down arrow moves the volume this far, in percent.
+/// One press of the up or down arrow, or one notch of the wheel over the box,
+/// moves the volume this far, in percent.
 const VOLUME_STEP: f32 = 5.0;
+
+/// How far one point of mouse movement turns the volume, in percent. Half a
+/// percent per point is half the speed egui's own drag would give: a whole
+/// percent is two pixels of travel, so an odd number is easy to land on.
+const VOLUME_PER_POINT: f32 = 0.5;
+
+/// A smooth wheel reports points rather than notches; this many of them are
+/// one notch.
+const POINTS_PER_NOTCH: f32 = 50.0;
 
 enum Msg {
     Bins(Result<Bins, String>),
@@ -201,6 +211,13 @@ pub struct App {
     /// The preview's loudness in percent, 0..=200. It is also the volume the
     /// save applies when *Apply current volume level to output* is ticked.
     volume: f32,
+    /// The part of a wheel notch that has arrived but not yet filled one: a
+    /// smooth wheel sends a few points at a time, and a step should wait for
+    /// the rest instead of being rounded away.
+    volume_notches: f32,
+    /// Where the volume box was drawn last frame. Nothing in the window needs
+    /// it; the tests put the pointer over the box with it.
+    volume_box: Rect,
     /// Whether the saved file takes that volume.
     apply_volume: bool,
     /// Video time the current playback started at, and how many frames it has
@@ -294,6 +311,8 @@ impl App {
             sound: None,
             sound_on: true,
             volume: 100.0,
+            volume_notches: 0.0,
+            volume_box: Rect::NOTHING,
             apply_volume: false,
             play_from: 0.0,
             play_frames: 0,
@@ -601,6 +620,59 @@ impl App {
             self.volume = v;
             self.volume_changed();
         }
+    }
+
+    /// The drag of the volume box, in points.
+    ///
+    /// The pointer's position cannot drive this. Windows stops a pointer at
+    /// the edge of the screen, so a drag that follows it stops there too, and
+    /// the volume would be stuck halfway up just because the window is not
+    /// full-screen. The mouse's own movement keeps arriving after the pointer
+    /// has stopped, in pixels, so that is what moves the number - the drag
+    /// then works until the button is let go, wherever the pointer is.
+    ///
+    /// Raw motion is optional, and a backend that does not report it still
+    /// moves the pointer, which is the same movement in points.
+    fn volume_drag_points(events: &[egui::Event], pointer_delta: Vec2, pixels_per_point: f32) -> f32 {
+        let raw: f32 = events
+            .iter()
+            .map(|e| match e {
+                // Up as well as right: a small box is easier to drag upwards.
+                egui::Event::MouseMoved(d) => d.x - d.y,
+                _ => 0.0,
+            })
+            .sum();
+        if raw != 0.0 {
+            raw / pixels_per_point.max(0.01)
+        } else {
+            pointer_delta.x - pointer_delta.y
+        }
+    }
+
+    /// How many notches of the wheel this frame's events add up to. A notched
+    /// mouse sends whole lines; a smooth wheel sends points, which are counted
+    /// in fractions of a notch so that one 5% step still needs a whole notch.
+    fn volume_scroll_notches(events: &[egui::Event]) -> f32 {
+        events
+            .iter()
+            .map(|e| match e {
+                egui::Event::MouseWheel { unit, delta, .. } => match unit {
+                    egui::MouseWheelUnit::Line => delta.y,
+                    egui::MouseWheelUnit::Point => delta.y / POINTS_PER_NOTCH,
+                    egui::MouseWheelUnit::Page => delta.y,
+                },
+                _ => 0.0,
+            })
+            .sum()
+    }
+
+    /// Adds this frame's notches to the part of one already waiting, and
+    /// returns the whole ones to step by, keeping the rest for next frame.
+    fn whole_notches(left: &mut f32, notches: f32) -> f32 {
+        *left += notches;
+        let steps = left.trunc();
+        *left -= steps;
+        steps
     }
 
     /// Dropping the player kills the decoder and joins its reader thread.
@@ -1210,22 +1282,42 @@ impl App {
                 // The preview's loudness - and, with the box further along the
                 // format row ticked, the saved file's too. One control: a box
                 // that drags like a slider and can be clicked and typed into.
-                // It moves at half the usual drag speed, so an odd percentage
-                // is easy to land on.
                 let typed = ui
                     .add_enabled(
                         has_sound,
+                        // The drag itself is done below, from the mouse's own
+                        // movement: egui would move the number by the pointer's
+                        // position, which stops at the edge of the screen.
                         egui::DragValue::new(&mut self.volume)
                             .range(0.0..=200.0)
                             .suffix("%")
                             .max_decimals(0)
-                            .speed(0.5),
+                            .speed(0.0),
                     )
                     .on_hover_text(
-                        "How loud the preview plays. Drag it, or click and type a number; tick \
-                         *Apply current volume level to output* to use it in the saved file too.",
+                        "How loud the preview plays. Drag it, scroll over it for 5% a notch, or \
+                         click and type a number; tick *Apply current volume level to output* to use \
+                         it in the saved file too.",
                     )
                     .on_disabled_hover_text("This video has no audio track.");
+                self.volume_box = typed.rect;
+                if typed.dragged() && has_sound {
+                    let moved = ui.input(|i| Self::volume_drag_points(&i.events, i.pointer.delta(), i.pixels_per_point));
+                    if moved != 0.0 {
+                        self.volume = (self.volume + moved * VOLUME_PER_POINT).clamp(0.0, 200.0);
+                        self.volume_changed();
+                    }
+                }
+                if typed.hovered() && has_sound {
+                    let notches = ui.input(|i| Self::volume_scroll_notches(&i.events));
+                    let steps = Self::whole_notches(&mut self.volume_notches, notches);
+                    if steps != 0.0 {
+                        self.nudge_volume(steps);
+                    }
+                } else {
+                    // Half a notch left behind is not owed to the next visit.
+                    self.volume_notches = 0.0;
+                }
                 if typed.changed() {
                     self.volume_changed();
                 }
@@ -1822,6 +1914,134 @@ mod tests {
         // The keys move the shared number only: they do not opt the save in.
         assert!(!app.apply_volume, "the arrows must not tick the format row box");
         assert!(app.plan().unwrap().volume.is_none());
+    }
+
+    #[test]
+    fn a_drag_uses_the_mouses_own_travel() {
+        let m = |x: f32, y: f32| Event::MouseMoved(vec2(x, y));
+        // Right and up both turn it up: x minus y, as egui's own drag does.
+        assert_eq!(App::volume_drag_points(&[m(12.0, 0.0)], Vec2::ZERO, 1.0), 12.0);
+        assert_eq!(App::volume_drag_points(&[m(0.0, -8.0)], Vec2::ZERO, 1.0), 8.0);
+        // Raw motion is in pixels; the window is in points.
+        assert_eq!(App::volume_drag_points(&[m(15.0, 0.0)], Vec2::ZERO, 1.5), 10.0);
+        // No raw motion this frame: the pointer's own movement stands in.
+        assert_eq!(App::volume_drag_points(&[], vec2(6.0, 2.0), 1.0), 4.0);
+        // Neither, on a backend that reports neither: the drag goes nowhere,
+        // rather than jumping by a guess.
+        assert_eq!(App::volume_drag_points(&[], Vec2::ZERO, 1.0), 0.0);
+    }
+
+    #[test]
+    fn half_a_notch_waits_for_the_other_half() {
+        let mut left = 0.0;
+        assert_eq!(App::whole_notches(&mut left, 0.5), 0.0, "half a notch is no step yet");
+        assert_eq!(App::whole_notches(&mut left, 0.5), 1.0, "two halves are one step");
+        assert_eq!(left, 0.0);
+        assert_eq!(App::whole_notches(&mut left, 2.0), 2.0);
+        assert_eq!(App::whole_notches(&mut left, -1.0), -1.0);
+        assert_eq!(left, 0.0);
+        // A slow wheel's leftover is a fraction, never a step of its own.
+        assert_eq!(App::whole_notches(&mut left, 0.4), 0.0);
+        assert!((left - 0.4).abs() < 1e-6, "left {left}");
+    }
+
+    #[test]
+    fn the_wheel_over_the_volume_box_steps_the_volume() {
+        let ctx = egui::Context::default();
+        let mut app = App::with_ctx(&ctx);
+        let mut t = 0.0;
+        step(&mut app, &ctx, &mut t, vec![]);
+        wait_until(&mut app, &ctx, &mut t, "ffmpeg", |a| a.bins().is_some());
+
+        app.open(&ctx, make_src());
+        wait_until(&mut app, &ctx, &mut t, "preview", |a| a.info.is_some() && a.texture.is_some());
+        assert_eq!(app.volume, 100.0);
+        assert!(app.volume_box.width() > 0.0, "the box should have been drawn");
+
+        let notch = |n: f32| Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Line,
+            delta: vec2(0.0, n),
+            modifiers: Modifiers::NONE,
+        };
+        let points = |n: f32| Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: vec2(0.0, n),
+            modifiers: Modifiers::NONE,
+        };
+
+        // The wheel only counts over the box.
+        let centre = app.volume_box.center();
+        step(&mut app, &ctx, &mut t, vec![Event::PointerMoved(centre)]);
+        step(&mut app, &ctx, &mut t, vec![notch(1.0)]);
+        assert_eq!(app.volume, 105.0, "one notch is five percent");
+        step(&mut app, &ctx, &mut t, vec![notch(-3.0)]);
+        assert_eq!(app.volume, 90.0, "three notches down are fifteen percent");
+
+        // A smooth wheel sends points, and half a notch is not a step.
+        step(&mut app, &ctx, &mut t, vec![points(25.0)]);
+        assert_eq!(app.volume, 90.0);
+        step(&mut app, &ctx, &mut t, vec![points(25.0)]);
+        assert_eq!(app.volume, 95.0);
+
+        // Away from the box the wheel is somebody else's, and leaves it be.
+        step(&mut app, &ctx, &mut t, vec![Event::PointerMoved(pos2(5.0, 5.0))]);
+        step(&mut app, &ctx, &mut t, vec![notch(2.0)]);
+        assert_eq!(app.volume, 95.0);
+
+        // Neither the wheel nor the arrows tick the save's own box.
+        assert!(!app.apply_volume);
+        assert!(app.plan().unwrap().volume.is_none());
+    }
+
+    /// A pointer held at the edge of the screen stops moving, and a volume that
+    /// follows the pointer would stop with it. The mouse itself keeps moving,
+    /// so that is what the drag follows.
+    #[test]
+    fn the_drag_keeps_going_where_the_pointer_cannot() {
+        let ctx = egui::Context::default();
+        let mut app = App::with_ctx(&ctx);
+        let mut t = 0.0;
+        step(&mut app, &ctx, &mut t, vec![]);
+        wait_until(&mut app, &ctx, &mut t, "ffmpeg", |a| a.bins().is_some());
+
+        app.open(&ctx, make_src());
+        wait_until(&mut app, &ctx, &mut t, "preview", |a| a.info.is_some() && a.texture.is_some());
+
+        let m = Modifiers::NONE;
+        let start = app.volume_box.center();
+        step(&mut app, &ctx, &mut t, vec![Event::PointerMoved(start)]);
+        step(
+            &mut app,
+            &ctx,
+            &mut t,
+            vec![Event::PointerButton { pos: start, button: PointerButton::Primary, pressed: true, modifiers: m }],
+        );
+        // Ten points right: the drag starts, and the mouse reports the same
+        // ten points of its own movement, because it really did move.
+        step(
+            &mut app,
+            &ctx,
+            &mut t,
+            vec![Event::PointerMoved(start + vec2(10.0, 0.0)), Event::MouseMoved(vec2(10.0, 0.0))],
+        );
+        assert!((app.volume - 105.0).abs() < 0.01, "volume {}", app.volume);
+
+        // Now the pointer is against the edge of the screen and cannot move any
+        // further, while the mouse under the hand keeps going right.
+        step(&mut app, &ctx, &mut t, vec![Event::MouseMoved(vec2(20.0, 0.0))]);
+        assert!((app.volume - 115.0).abs() < 0.01, "volume {}", app.volume);
+        step(&mut app, &ctx, &mut t, vec![Event::MouseMoved(vec2(20.0, 0.0))]);
+        assert!((app.volume - 125.0).abs() < 0.01, "volume {}", app.volume);
+
+        // Letting go lands on a whole percent, and leaves the save alone.
+        step(
+            &mut app,
+            &ctx,
+            &mut t,
+            vec![Event::PointerButton { pos: start, button: PointerButton::Primary, pressed: false, modifiers: m }],
+        );
+        assert_eq!(app.volume, 125.0);
+        assert!(!app.apply_volume);
     }
 
     #[test]
