@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod audio;
 mod bundled;
 mod crop;
 mod ffmpeg;
@@ -9,11 +10,11 @@ mod timeline;
 /// The program's name, spelled the one way it is spelled everywhere.
 pub const APP_NAME: &str = "finnCrop";
 
-/// `1.10`. Cargo only accepts three-part versions, so Cargo.toml carries
-/// `1.10.0` and build.rs trims the trailing part once, here.
+/// `1.11`. Cargo only accepts three-part versions, so Cargo.toml carries
+/// `1.11.0` and build.rs trims the trailing part once, here.
 pub const VERSION: &str = env!("FINN_CROP_VERSION");
 
-/// What the title bar and the About window say: `finnCrop v1.10`.
+/// What the title bar and the About window say: `finnCrop v1.11`.
 pub fn version_line() -> String {
     format!("{APP_NAME} v{VERSION}")
 }

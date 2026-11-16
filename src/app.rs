@@ -1,3 +1,4 @@
+use crate::audio;
 use crate::crop::{self, Aspect, CropRect, Handle};
 use crate::ffmpeg::{self, Bins, Job, Mode, VideoInfo};
 use crate::timeline;
@@ -185,6 +186,11 @@ pub struct App {
     export: Option<Exporting>,
     /// Playback, when it is running.
     player: Option<ffmpeg::Player>,
+    /// The soundtrack of that playback. Kept apart from the player: sound is
+    /// optional and can fail while the picture plays on.
+    sound: Option<audio::Sound>,
+    /// The *Sound* switch, which only affects the preview.
+    sound_on: bool,
     /// Video time the current playback started at, and how many frames it has
     /// shown since: position follows the pictures, not the wall clock.
     play_from: f64,
@@ -263,6 +269,8 @@ impl App {
             quality: Quality::High,
             export: None,
             player: None,
+            sound: None,
+            sound_on: true,
             play_from: 0.0,
             play_frames: 0,
             notice: None,
@@ -509,7 +517,7 @@ impl App {
 
         let ctx2 = ctx.clone();
         let repaint: Arc<dyn Fn() + Send + Sync> = Arc::new(move || ctx2.request_repaint());
-        match ffmpeg::Player::start(
+        let started = ffmpeg::Player::start(
             &bins,
             &info.path,
             self.pos,
@@ -519,21 +527,59 @@ impl App {
             info.fps,
             crop_px,
             repaint,
-        ) {
+        );
+        match started {
             Ok(p) => {
                 self.player = Some(p);
                 self.notice = None;
+                self.start_sound(self.pos, false);
             }
             Err(e) => self.notice = Some(Notice::Error(e)),
         }
         ctx.request_repaint();
     }
 
+    /// Starts the soundtrack at `from`, or leaves the preview silent when the
+    /// switch is off or the file has no track. `now` is for the switch being
+    /// ticked during playback: the picture is already running, so the sound
+    /// has nothing to wait for.
+    fn start_sound(&mut self, from: f64, now: bool) {
+        self.sound = None;
+        if !self.sound_on {
+            return;
+        }
+        let (Some(bins), Some(info)) = (self.bins(), self.info.clone()) else { return };
+        if info.a_codec.is_none() {
+            return;
+        }
+        self.sound = audio::Sound::start(&bins, &info.path, from, self.end).ok();
+        if now {
+            if let Some(sound) = self.sound.as_ref() {
+                sound.begin();
+            }
+        }
+    }
+
     /// Dropping the player kills the decoder and joins its reader thread.
     ///
     /// The last picture it drew is the crop, so a still of the whole frame has
     /// to be grabbed again before the preview goes back to showing one.
+    ///
+    /// The sound goes first and at once: a pause should be silent the moment it
+    /// is asked for, not one buffer later.
     fn stop_playback(&mut self) {
+        self.sound = None;
+        let was = self.player.take();
+        if was.is_some() && self.info.is_some() {
+            self.pending_t = Some(self.pos);
+        }
+    }
+
+    /// Playback reached the end of the trim by itself. The picture is done, but
+    /// the sound still has a few buffers queued and cutting them would clip the
+    /// last word; that thread stops when it runs out, and the next playback
+    /// collects what is left of it.
+    fn finish_playback(&mut self) {
         let was = self.player.take();
         if was.is_some() && self.info.is_some() {
             self.pending_t = Some(self.pos);
@@ -570,11 +616,15 @@ impl App {
         self.play_frames = player.decoded();
         if self.play_frames > 0 {
             self.pos = self.play_from + self.played();
+            // The first picture is on screen, so the sound may follow it now.
+            if let Some(sound) = self.sound.as_ref() {
+                sound.begin();
+            }
         }
 
         let ended = player.finished() || self.pos >= self.end - 0.001;
         if ended {
-            self.stop_playback();
+            self.finish_playback();
             self.pos = self.pos.clamp(self.start, self.end);
             ctx.request_repaint();
         } else {
@@ -1077,6 +1127,20 @@ impl App {
                     .clicked();
                 if play {
                     self.toggle_play(ctx);
+                }
+                // The preview's own switch, not an output setting: what the
+                // saved file does with its sound is *Keep audio*, further along.
+                let has_sound = info.a_codec.is_some();
+                if ui
+                    .add_enabled(has_sound, egui::Checkbox::new(&mut self.sound_on, "Sound"))
+                    .on_hover_text("Plays the soundtrack with the preview.")
+                    .on_disabled_hover_text("This video has no audio track.")
+                    .changed()
+                    && self.is_playing()
+                {
+                    // Ticking it mid-play starts the sound at the frame on
+                    // screen; unticking it stops the sound there too.
+                    self.start_sound(self.pos, true);
                 }
                 ui.separator();
                 if ui.button("Set start").on_hover_text("Trim start = current position").clicked() {

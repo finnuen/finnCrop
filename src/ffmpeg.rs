@@ -58,7 +58,8 @@ pub fn find_bins() -> Res<Bins> {
     }
 }
 
-fn command(bin: &Path) -> Command {
+/// A command for one of the packed programs, with no console window behind it.
+pub(crate) fn command(bin: &Path) -> Command {
     #[allow(unused_mut)]
     let mut c = Command::new(bin);
     #[cfg(windows)]
@@ -209,8 +210,9 @@ pub fn grab_frame(bins: &Bins, path: &Path, t: f64, pw: usize, ph: usize) -> Res
     Ok((pw, ph, data))
 }
 
-/// Real-time playback of a slice of the video. Silent: there is no audio sink,
-/// and previewing the picture is what this is for.
+/// Real-time playback of a slice of the video, picture only. The sound is a
+/// second, separate decoder (`audio::Sound`), so a machine with no working
+/// sound device still gets its preview.
 ///
 /// One ffmpeg process decodes `from`..`until` and writes raw RGBA frames to a
 /// pipe as fast as it can; the reader thread hands them on one per frame of the
