@@ -1,3 +1,7 @@
+Direct download latest
+
+Windows 10/11  :  https://github.com/finnuen/finnCrop/releases/latest/download/finnCrop.exe
+
 <div align="center">
 
 <img src="src/app-icon.png" width="110" alt="finnCrop">
